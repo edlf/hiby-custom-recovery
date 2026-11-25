@@ -612,3 +612,4 @@ int mtd_dump_end(mtd_dump_t *d, mtd_dump_stats_t *st) {
 	free(d);
 	return rc;
 }
+

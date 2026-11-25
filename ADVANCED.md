@@ -87,10 +87,19 @@ next start offers it again. "Reboot to system" sets it back.
    - Every chunk matches its md5 in `ota_md5_<img>.<img_md5>`. Chunks are
      named `<img>.0000.<img_md5>`, then each after the md5 of the one
      before. Together they must add up to `img_size` and hash to `img_md5`.
-   - `ota_vN/ota_compatibility.in` starts with `hiby_r1_` on the R1. This
-     is the only check of which player a package is for. R3 Pro II
-     packages don't have this file, so there it's optional, but if present
-     it must match.
+   - `ota_vN/ota_compatibility.in` starts with `hiby_r1_` on the R1. R3
+     Pro II packages don't have this file, so there it's optional, but if
+     present it must match.
+   - The system image's `/usr/resource/hostname` names this player
+     (`HiBy R1` / `HiBy R3PROII`). It's read straight from the chunks by a
+     small squashfs reader (`src/squashfs.c`, LZO), touching only a few
+     metadata blocks and one fragment; nothing is copied anywhere. Another
+     player's system is always refused. If it can't be read, the R1 relies on
+     its compatibility record; the R3 Pro II refuses the package.
+   - The kernel is a uImage the SPL can boot, by the same rules as
+     `fastboot flash kernel`: magic, header and data CRC, Linux/MIPS/kernel/
+     uncompressed, loaded inside RAM above `0x80008000` (64 MiB), entry
+     point inside the image. The SPL itself checks none of this.
 3. **Mark the update.** The record is set to `ota:kernel2`, so if the
    write is cut short the player starts the recovery again.
 4. **Write.** The kernel goes to `kernel` and the system to the first
@@ -253,8 +262,8 @@ Nothing comes from sonix-player.
 The app needs nothing outside `recovery/`. On first use `make` fetches or
 builds into `deps/` (not in git):
 
-- LVGL 9.6.0 (cloned)
-- FreeType 2.13.3 (downloaded; built static for the device, and for the PC in `build/host-freetype/`)
+- LVGL 9.6.0 (cloned, and checked to be commit `80ca777e`: `LVGL_COMMIT`)
+- FreeType 2.13.3 (downloaded and checked against its sha256, `FT_SHA256`; built static for the device, and for the PC in `build/host-freetype/`)
 - the cross toolchain (GCC 9, glibc 2.27), built by `rockboxdev/rockboxdev.sh`
 
 The toolchain takes longest. `make toolchain` builds only it, and

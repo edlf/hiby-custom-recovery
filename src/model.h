@@ -16,6 +16,10 @@
 //                 accepted; a present one must still match. The record is the
 //                 only check of which player a package is for.
 //   compat_needed whether the file must be there
+//   rootfs_hostname  what /usr/resource/hostname holds in this model's
+//                 system image, stock and Sonix alike ("HiBy R1",
+//                 "HiBy R3PROII"): which player a package is for, whatever
+//                 its compatibility record says (update.c).
 //   uboot_image   Zee's bootloader's file name in the recovery root fs
 //                 (bootloader.h), the base image without a partition table
 //   uboot_installable  whether the recovery offers to install it. Not on the
@@ -28,15 +32,16 @@ typedef struct {
 	const char *upt_stem;
 	const char *compat;
 	int compat_needed;
+	const char *rootfs_hostname;
 	const char *uboot_image;
 	int uboot_installable;
 	int panel_w, panel_h;
 } model_t;
 
 #if defined(MODEL_R1)
-#define MODEL_INIT {"HiBy R1", "r1", "hiby_r1_", 1, "u-boot-hiby_r1.bin", 1, 480, 800}
+#define MODEL_INIT {"HiBy R1", "r1", "hiby_r1_", 1, "HiBy R1", "u-boot-hiby_r1.bin", 1, 480, 800}
 #elif defined(MODEL_R3PROII)
-#define MODEL_INIT {"HiBy R3 Pro II", "r3proii", "hiby_r3proii_", 0, "u-boot-hiby_r3proii.bin", 0, 480, 720}
+#define MODEL_INIT {"HiBy R3 Pro II", "r3proii", "hiby_r3proii_", 0, "HiBy R3PROII", "u-boot-hiby_r3proii.bin", 0, 480, 720}
 #else
 #error "build with MODEL_R1 or MODEL_R3PROII (make MODEL=r1 or MODEL=r3proii)"
 #endif

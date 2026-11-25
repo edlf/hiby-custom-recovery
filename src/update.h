@@ -15,8 +15,9 @@
 //   ota_vN/ota_md5_<img>.<md5 of chunk 0>  one md5 per chunk
 //
 // Before anything is erased the whole package is checked here: the
-// compatibility record (the only thing that says which player it is for),
-// that ota_update.in names this version, that each image is a kernel or a
+// compatibility record and the system image's /usr/resource/hostname (read
+// in place, squashfs.h) for which player it is for, that the kernel is a
+// uImage the bootloader can start, that ota_update.in names this version, that each image is a kernel or a
 // rootfs (once each) and fits its partition, and every chunk against its md5
 // in ota_md5_<img>.<img_md5>, with the md5 of them all against img_md5. The
 // card stays read-only throughout (storage.h).

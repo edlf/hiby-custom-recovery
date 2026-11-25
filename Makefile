@@ -25,10 +25,13 @@ MODEL ?= r1
 
 DEPS = $(CURDIR)/deps
 LVGL_VER = 9.6.0
+# the commit tag v$(LVGL_VER) has to point to
+LVGL_COMMIT = 80ca777e37a2b176770726a02e07a6fb79ef0b39
 LVGL_DIR ?= $(DEPS)/lvgl
 TOOLCHAIN_DIR ?= $(DEPS)/rockbox-toolchain
 CROSS ?= $(TOOLCHAIN_DIR)/bin/mipsel-rockbox-linux-gnu-
 FT_VER = 2.13.3
+FT_SHA256 = 0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289
 FT_TARBALL = $(DEPS)/freetype-$(FT_VER).tar.xz
 FT_URL = https://download.savannah.gnu.org/releases/freetype/freetype-$(FT_VER).tar.xz
 FT_URL_MIRROR = https://downloads.sourceforge.net/project/freetype/freetype2/$(FT_VER)/freetype-$(FT_VER).tar.xz
@@ -41,11 +44,19 @@ CC = $(CROSS)gcc
 STRIP = $(CROSS)strip
 READELF = $(CROSS)readelf
 
-# LVGL is cloned before the source list below is read (not for `make clean`).
-ifeq ($(filter clean,$(MAKECMDGOALS)),)
+# LVGL is cloned before the source list below is read (not for `make clean`
+# or `make distclean`), and has to be the pinned commit: a moved tag or a
+# tampered clone stops the build.
+ifeq ($(filter clean distclean,$(MAKECMDGOALS)),)
 ifeq ($(wildcard $(LVGL_DIR)/lvgl.h),)
 $(info cloning LVGL v$(LVGL_VER) into $(LVGL_DIR))
 $(shell mkdir -p $(DEPS) && git clone -q --depth 1 -b v$(LVGL_VER) https://github.com/lvgl/lvgl.git $(LVGL_DIR) >&2)
+endif
+ifneq ($(origin LVGL_DIR),command line)
+LVGL_HAVE := $(shell git -C $(LVGL_DIR) rev-parse HEAD 2>/dev/null)
+ifneq ($(LVGL_HAVE),$(LVGL_COMMIT))
+$(error $(LVGL_DIR) is at '$(LVGL_HAVE)', not v$(LVGL_VER) ($(LVGL_COMMIT)): remove it (make distclean) to clone it again)
+endif
 endif
 endif
 
@@ -110,6 +121,8 @@ $(TOOLCHAIN_GCC):
 $(FT_TARBALL):
 	@mkdir -p $(DEPS)
 	wget -q -O $@.part $(FT_URL) || wget -q -O $@.part $(FT_URL_MIRROR)
+	echo "$(FT_SHA256)  $@.part" | sha256sum -c --quiet - || \
+		{ rm -f $@.part; echo "$(FT_TARBALL): not the FreeType $(FT_VER) release (sha256)" >&2; exit 1; }
 	mv $@.part $@
 
 $(FT_SRC)/configure: $(FT_TARBALL)

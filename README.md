@@ -6,6 +6,14 @@ and can install a custom bootloader for USB fastboot support (no more cloner).
 
 It's a small LVGL app, controlled by touch or the side keys.
 
+<p>
+  <img src="assets/screenshots/main.png" width="160" alt="Main menu">
+  <img src="assets/screenshots/install.png" width="160" alt="Install confirmation">
+  <img src="assets/screenshots/update-done.png" width="160" alt="Update installed and verified">
+  <img src="assets/screenshots/advanced.png" width="160" alt="Advanced menu">
+  <img src="assets/screenshots/backup.png" width="160" alt="Back up partitions">
+</p>
+
 For internals, build details and the PC simulator, see
 [ADVANCED.md](ADVANCED.md).
 

@@ -4,6 +4,7 @@
 #include "log.h"
 #include "md5.h"
 #include "model.h"
+#include "squashfs.h"
 #include "storage.h"
 
 #include <dirent.h>
@@ -171,6 +172,106 @@ static int read_md5_list(const char *dir, const image_t *im, char (*list)[33], i
 	return n;
 }
 
+// CRC-32 (IEEE, as zlib and U-Boot have it), fed in pieces.
+static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n) {
+	static uint32_t table[256];
+	if (!table[1]) {
+		for (uint32_t i = 0; i < 256; i++) {
+			uint32_t c = i;
+			for (int k = 0; k < 8; k++) {
+				c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
+			}
+			table[i] = c;
+		}
+	}
+	crc = ~crc;
+	while (n--) {
+		crc = table[(crc ^ *p++) & 0xff] ^ (crc >> 8);
+	}
+	return ~crc;
+}
+
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+// The kernel has to be a uImage the SPL can boot: it reads the legacy header,
+// copies header + data to load - 64 and jumps to the entry point without
+// checking anything (a bad one leaves the player hanging at power-on). The
+// same rules as fastboot's fb_check_kernel_image() (uboot/): magic, header
+// and data CRC, Linux/MIPS/kernel/uncompressed, inside RAM above the SPL
+// (0x80008000 up to the 64 MiB the boot gives Linux), entry inside the image.
+#define UIMAGE_HDR 64
+#define SPL_RAM_START 0x80008000u
+#define RAM_END (0x80000000u + (64u << 20))
+
+typedef struct {
+	uint8_t hdr[UIMAGE_HDR];
+	size_t have;	   // header bytes seen
+	long long data;	   // data bytes seen
+	uint32_t dcrc;	   // CRC of the data so far
+} uimage_check_t;
+
+static void uimage_feed(uimage_check_t *u, const uint8_t *p, size_t n) {
+	if (u->have < UIMAGE_HDR) {
+		size_t k = UIMAGE_HDR - u->have < n ? UIMAGE_HDR - u->have : n;
+		memcpy(u->hdr + u->have, p, k);
+		u->have += k;
+		p += k;
+		n -= k;
+	}
+	if (u->have == UIMAGE_HDR && n > 0) {
+		long long want = (long long)be32(u->hdr + 12) - u->data; // ih_size
+		size_t k = want > 0 ? (want < (long long)n ? (size_t)want : n) : 0;
+		u->dcrc = crc32_update(u->dcrc, p, k);
+		u->data += (long long)k;
+	}
+}
+
+static int uimage_ok(const uimage_check_t *u, char *why, size_t why_size) {
+	const uint8_t *h = u->hdr;
+	if (u->have < UIMAGE_HDR || be32(h) != 0x27051956u) {
+		snprintf(why, why_size, "The kernel is not a uImage (bad magic).");
+		return -1;
+	}
+	uint8_t copy[UIMAGE_HDR];
+	memcpy(copy, h, sizeof(copy));
+	memset(copy + 4, 0, 4); // ih_hcrc counts as 0
+	if (crc32_update(0, copy, sizeof(copy)) != be32(h + 4)) {
+		snprintf(why, why_size, "The kernel's uImage header is corrupt (checksum).");
+		return -1;
+	}
+	uint32_t size = be32(h + 12), load = be32(h + 16), ep = be32(h + 20);
+	if (u->data != (long long)size) {
+		snprintf(why, why_size, "The kernel is truncated (%lld of %u data bytes).", u->data, size);
+		return -1;
+	}
+	if (u->dcrc != be32(h + 24)) {
+		snprintf(why, why_size, "The kernel's data is corrupt (uImage checksum).");
+		return -1;
+	}
+	if (h[28] != 5 || h[29] != 5 || h[30] != 2 || h[31] != 0) { // os, arch, type, comp
+		snprintf(why, why_size, "The kernel is not one the bootloader can start (os/arch/type/comp %d/%d/%d/%d, "
+								"needs 5/5/2/0).",
+				 h[28], h[29], h[30], h[31]);
+		return -1;
+	}
+	uint64_t start = (uint64_t)load - UIMAGE_HDR, end = (uint64_t)load + size;
+	if (load < UIMAGE_HDR || start < SPL_RAM_START || end > RAM_END) {
+		snprintf(why, why_size, "The kernel loads at 0x%08x, outside the RAM the bootloader can use.", load);
+		return -1;
+	}
+	if (ep < load || (uint64_t)ep >= end) {
+		snprintf(why, why_size, "The kernel's entry point 0x%08x is outside it.", ep);
+		return -1;
+	}
+	return 0;
+}
+
+// The chunk file names, in order: <name>.0000.<img_md5>, then each named
+// after the md5 the list gives the chunk before it. `n` from read_md5_list().
+static void chunk_path(const char *dir, const image_t *im, char (*list)[33], int i, char *out, size_t size) {
+	snprintf(out, size, "%s/%s.%04d.%s", dir, im->name, i, i == 0 ? im->md5 : list[i - 1]);
+}
+
 // One pass over an image's chunks, in order: each chunk's md5 against the
 // list, the size, and the md5 of them all against img_md5. With `w`, the data
 // also goes to the writer as it is read, and progress is shown out of
@@ -195,6 +296,9 @@ static int chunk_pass(const char *dir, const image_t *im, mtd_image_writer_t *w,
 	}
 	md5_ctx all;
 	md5_init(&all);
+	bool is_kernel = strcmp(im->type, "kernel") == 0;
+	uimage_check_t uck;
+	memset(&uck, 0, sizeof(uck));
 	char prev[33];
 	snprintf(prev, sizeof(prev), "%s", im->md5);
 	long long got = 0;
@@ -238,6 +342,16 @@ static int chunk_pass(const char *dir, const image_t *im, mtd_image_writer_t *w,
 			break;
 		}
 		md5_update(&all, chunk, len);
+		if (is_kernel) {
+			uimage_feed(&uck, chunk, len);
+			if (w && got == 0 && (uck.have < UIMAGE_HDR || be32(uck.hdr) != 0x27051956u)) {
+				// checked in full before anything was written; a card that now
+				// reads otherwise stops here, before the first byte goes in
+				snprintf(why, why_size, "The kernel is not a uImage (bad magic).");
+				rc = -1;
+				break;
+			}
+		}
 		if (w) {
 			for (size_t o = 0; o < len && rc == 0; o += CHUNK_BUF) {
 				size_t k = len - o < CHUNK_BUF ? len - o : CHUNK_BUF;
@@ -259,11 +373,88 @@ static int chunk_pass(const char *dir, const image_t *im, mtd_image_writer_t *w,
 		if (strcmp(md5, im->md5) != 0) {
 			snprintf(why, why_size, "%s is corrupt (md5 mismatch). Copy the file to the card again.", im->name);
 			rc = -1;
+		} else if (is_kernel && uimage_ok(&uck, why, why_size) != 0) {
+			rc = -1;
 		}
 	}
 	free(buf);
 	free(chunk);
 	return rc;
+}
+
+// The system image as one stream over its chunk files, for squashfs.c: a
+// read at an offset of the image goes to the chunk(s) holding it.
+typedef struct {
+	char (*paths)[600];
+	long long *ends; // where each chunk ends in the image
+	int n;
+} chunk_image_t;
+
+static int chunk_image_read(void *ctx, uint64_t off, void *buf, size_t len) {
+	chunk_image_t *ci = ctx;
+	uint8_t *d = buf;
+	while (len > 0) {
+		int i = 0;
+		while (i < ci->n && (uint64_t)ci->ends[i] <= off) {
+			i++;
+		}
+		if (i == ci->n) {
+			return -1;
+		}
+		long long begin = i ? ci->ends[i - 1] : 0;
+		size_t k = (size_t)((uint64_t)ci->ends[i] - off) < len ? (size_t)((uint64_t)ci->ends[i] - off) : len;
+		FILE *f = fopen(ci->paths[i], "rb");
+		bool ok = f && fseeko(f, (off_t)(off - (uint64_t)begin), SEEK_SET) == 0 && fread(d, 1, k, f) == k;
+		if (f) {
+			fclose(f);
+		}
+		if (!ok) {
+			return -1;
+		}
+		d += k;
+		off += k;
+		len -= k;
+	}
+	return 0;
+}
+
+// Which player the system image is for: its /usr/resource/hostname, read
+// straight from the chunks with squashfs.c (a few metadata blocks and one
+// fragment; nothing is put together or copied anywhere). 0 when it names this
+// player; otherwise the reason in `why`, and *unknown set when it could not be
+// read at all.
+static int check_rootfs_model(const char *dir, const image_t *im, bool *unknown, char *why, size_t why_size) {
+	static char list[MAX_CHUNKS][33];
+	static char paths[MAX_CHUNKS][600];
+	static long long ends[MAX_CHUNKS];
+	*unknown = true;
+	int n = read_md5_list(dir, im, list, MAX_CHUNKS);
+	chunk_image_t ci = {paths, ends, 0};
+	long long at = 0;
+	for (int i = 0; i < n && at < im->size; i++) {
+		chunk_path(dir, im, list, i, paths[i], sizeof(paths[i]));
+		struct stat st;
+		if (stat(paths[i], &st) != 0) {
+			break;
+		}
+		at += st.st_size;
+		ends[i] = at;
+		ci.n = i + 1;
+	}
+	char host[128];
+	if (squashfs_read_file(chunk_image_read, &ci, "usr/resource/hostname", host, sizeof(host)) <= 0) {
+		snprintf(why, why_size, "the system image has no /usr/resource/hostname that can be read");
+		return -1;
+	}
+	*unknown = false;
+	host[strcspn(host, "\r\n")] = '\0';
+	if (strcmp(host, g_model.rootfs_hostname) != 0) {
+		snprintf(why, why_size, "This package is for another player: its system is a '%s', this is a %s.", host,
+				 g_model.name);
+		return -1;
+	}
+	LOG("update: the system image is a %s", host);
+	return 0;
 }
 
 // The card's <stem>.upt, in any case.
@@ -394,6 +585,21 @@ static int check_package(char *dir, size_t dir_size) {
 		}
 		LOG("update: %s: %lld bytes, every chunk's md5 and the whole md5 ok, fits %s (%lld bytes)", img[i].name,
 			img[i].size, dev, psize);
+		if (strcmp(img[i].type, "rootfs") == 0) {
+			// Which player it is for, from the system itself. Another player's
+			// system is always refused. When it cannot be read, the R1's
+			// compatibility record (checked above, required) still decides;
+			// the R3 Pro II's packages have none, so there nothing would.
+			set_phase("Checking which player it is for", -1);
+			bool unknown;
+			if (check_rootfs_model(dir, &img[i], &unknown, why, sizeof(why)) != 0) {
+				if (!unknown || !g_model.compat_needed) {
+					finish(UPDATE_FAILED, unknown ? "Cannot tell which player this package is for: %s." : "%s", why);
+					return -1;
+				}
+				LOG("update: %s; the compatibility record decides", why);
+			}
+		}
 	}
 	memcpy(checked_img, img, sizeof(img[0]) * (size_t)n);
 	n_checked = n;
