@@ -1,12 +1,12 @@
 // The PC side of make host: the display and input that the framebuffer and
 // evdev are on the device. Two ways to run it:
 //
-//   build/host/sonix_recovery_sim
+//   build/host/zees_recovery_sim
 //       a 480x800 window (SDL2, when the build found libsdl2-dev). Mouse is
 //       the touch panel; Up/Down (or Tab) move, Enter presses, Esc or
 //       Backspace is the Power key.
 //
-//   build/host/sonix_recovery_sim --shots DIR [--script "..."]
+//   build/host/zees_recovery_sim --shots DIR [--script "..."]
 //       no window: runs a script of key presses against the real interface
 //       and saves PNG screenshots into DIR. Script tokens, space separated:
 //         n p e x      Next, Prev, Enter, Power (back)
@@ -36,7 +36,7 @@
 
 #define DEFAULT_SCRIPT                                                                                                 \
 	"s:auto-countdown e s:main e s:install-confirm p e t:1500 s:update-running w s:update-result x "                  \
-	"n e s:choose-file x n n n e s:factory-reset x n n n n e s:advanced e s:backup x s:back-to-advanced x s:main"
+	"n e s:factory-reset x n n e s:advanced e s:choose-file x n e s:backup x s:back-to-advanced x s:main"
 
 // ---------------------------------------------------------------------------
 // Keys from the script

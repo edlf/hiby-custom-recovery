@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include "backup.h"
+#include "battery.h"
 #include "restore.h"
 #include "bootloader.h"
 #include "device.h"
@@ -23,7 +24,7 @@ static lv_obj_t *scr;
 static lv_timer_t *screen_timer; // the current screen's refresh, if any
 
 // main screen
-static lv_obj_t *lbl_boot, *lbl_card, *lbl_note;
+static lv_obj_t *lbl_boot, *lbl_card, *lbl_note, *bat_icon;
 
 // progress screen
 static lv_obj_t *lbl_warn, *lbl_phase, *bar, *lbl_msg, *btn_row;
@@ -33,7 +34,6 @@ static lv_obj_t *bl_phase, *bl_msg, *bl_buttons;
 static void show_main(void);
 static void show_advanced(void);
 static void show_browser(void);
-static void confirm_override(void);
 static bool battery_ok(void);
 
 // ---------------------------------------------------------------------------
@@ -46,7 +46,7 @@ static void screen_reset(void) {
 	}
 	lv_group_remove_all_objs(group);
 	lv_obj_clean(scr);
-	lbl_boot = lbl_card = lbl_note = NULL;
+	lbl_boot = lbl_card = lbl_note = bat_icon = NULL;
 	lbl_warn = lbl_phase = bar = lbl_msg = btn_row = NULL;
 	bl_phase = bl_msg = bl_buttons = NULL;
 }
@@ -304,9 +304,6 @@ static void update_poll(lv_timer_t *t) {
 			screen_timer = lv_timer_create(reboot_tick, 1000, NULL);
 		}
 	}
-	if (s.state == UPDATE_FAILED && s.compat_overridable) {
-		button(btn_row, "Install anyway", confirm_override, true);
-	}
 	lv_obj_t *b = button(btn_row, "Back", go_back, false);
 	if (s.state != UPDATE_DONE) {
 		lv_group_focus_obj(b);
@@ -315,13 +312,9 @@ static void update_poll(lv_timer_t *t) {
 
 // The file picked in the browser; empty for <stem>.upt.
 static char chosen_path[512];
-// Set only by "Install anyway", for the next start_update().
-static bool override_compat;
 
 static void start_update(void) {
-	bool ovr = override_compat;
-	override_compat = false;
-	if (update_start(chosen_path[0] ? chosen_path : NULL, ovr) != 0) {
+	if (update_start(chosen_path[0] ? chosen_path : NULL) != 0) {
 		show_message("Error", "An update is already running.");
 		return;
 	}
@@ -336,23 +329,7 @@ static void start_update(void) {
 	screen_timer = lv_timer_create(update_poll, 100, NULL);
 }
 
-// "Install anyway": the same file again, the compatibility record ignored.
-// Offered only when the record was the one thing wrong (update.c).
-static void start_update_override(void) {
-	override_compat = true;
-	start_update();
-}
-
-static void confirm_override(void) {
-	char msg[320];
-	snprintf(msg, sizeof(msg),
-			 "The package's compatibility record does not match the %s, but its system image is one. Install "
-			 "it anyway? Everything else is still checked.",
-			 g_model.name);
-	confirm("Install anyway", msg, "Install anyway", start_update_override);
-}
-
-// Installing the Sonix bootloader (bootloader.h)
+// Installing Zee's bootloader (bootloader.h)
 
 static void confirm_bootloader(void);
 
@@ -402,7 +379,7 @@ static void confirm_bootloader(void) {
 		return;
 	}
 	confirm("Install fastboot",
-			"Replaces HiBy's bootloader with the Sonix one, which adds USB fastboot (hold Play/Pause at power-on). "
+			"Replaces HiBy's bootloader with Zee's bootloader, which adds USB fastboot (hold Play/Pause at power-on). "
 			"The player's partition table is kept and the old bootloader is saved on the card if there is one. "
 			"If this write fails the player cannot start without Ingenic's USB boot tool.",
 			"Install", start_bootloader);
@@ -456,7 +433,7 @@ static void backup_no_userdata(void) { start_backup(false); }
 static void show_backup(void) {
 	page("Back up partitions");
 	label(scr,
-		  "Copies the flash partitions, raw, to a new sonix-backup folder on the card, with md5sums.txt to check "
+		  "Copies the flash partitions, raw, to a new zees-backup folder on the card, with md5sums.txt to check "
 		  "them on a PC. Nothing on the player is changed.",
 		  F24, S.text);
 	char a[64], b[64];
@@ -476,6 +453,11 @@ static int n_backups, cur_backup;
 static restore_part_t rparts[RESTORE_MAX_PARTS];
 static int n_rparts;
 static lv_obj_t *rchecks[RESTORE_MAX_PARTS];
+// What is ticked, kept apart from the checkboxes so it survives the
+// bootloader warning (another screen) and the confirmation's Cancel.
+static bool rsel[RESTORE_MAX_PARTS];
+static bool rsel_valid; // false: fresh from the backup list, take the defaults
+static int rfocus = -1; // the checkbox to focus when the screen comes back
 static uint32_t restore_mask;
 static void show_restore_list(void);
 static void show_restore_parts(void);
@@ -554,13 +536,17 @@ static void rs_poll(lv_timer_t *t) {
 }
 
 static void confirm_restore(void) {
+	// Every way out of here (Nothing ticked, Battery low, Cancel) comes back
+	// to the ticks as they are.
+	back_to = show_restore_parts;
 	restore_mask = 0;
-	char list[256] = "";
+	char list[320] = "";
 	for (int i = 0; i < n_rparts; i++) {
-		if (rchecks[i] && lv_obj_has_state(rchecks[i], LV_STATE_CHECKED)) {
+		if (rchecks[i] && rsel[i]) {
 			restore_mask |= 1u << rparts[i].num;
 			size_t l = strlen(list);
-			snprintf(list + l, sizeof(list) - l, "%s%s (mtd%d)", l ? ", " : "", part_title(&rparts[i]), rparts[i].num);
+			snprintf(list + l, sizeof(list) - l, "%s\u2022 %s (mtd%d)", l ? "\n" : "", part_title(&rparts[i]),
+					 rparts[i].num);
 		}
 	}
 	if (!restore_mask) {
@@ -570,15 +556,58 @@ static void confirm_restore(void) {
 	if (!battery_ok()) {
 		return;
 	}
-	char msg[480];
-	snprintf(msg, sizeof(msg),
-			 "Writes %s from %s over what the player has now. Everything is checked first; once writing starts it "
-			 "cannot be undone.%s",
-			 list, backups[cur_backup].name,
-			 (restore_mask & 1u) ? " The bootloader too: if that write fails the player cannot start without "
-								   "Ingenic's USB boot tool."
-								 : "");
-	confirm("Restore backup", msg, "Restore", run_restore);
+	rfocus = -1;
+	confirm("Restore backup", list, "Restore", run_restore);
+}
+
+// The bootloader, ticked: a warning first, and it stays ticked only if the
+// user says so. Run from lv_async_call(): the checkbox that asked is deleted
+// with its screen.
+static int bl_idx = -1;
+static bool bl_pending; // a warning is queued: a second tap must not queue another
+
+static void bl_include(void) {
+	if (bl_idx >= 0) {
+		rsel[bl_idx] = true;
+		rfocus = bl_idx;
+	}
+	show_restore_parts();
+}
+
+static void bl_leave_out(void) {
+	if (bl_idx >= 0) {
+		rsel[bl_idx] = false;
+		rfocus = bl_idx;
+	}
+	show_restore_parts();
+}
+
+static void bl_warning(void *idx_p) {
+	bl_pending = false;
+	bl_idx = (int)(intptr_t)idx_p;
+	page("Bootloader");
+	back_to = bl_leave_out; // Power: leave it out
+	label(scr,
+		  "Restoring the bootloader is risky. If the write fails or the backup's bootloader is wrong, the player "
+		  "will not start, and only Ingenic's USB boot tool can bring it back.",
+		  F24, S.warn);
+	button(scr, "Include bootloader", bl_include, true);
+	lv_group_focus_obj(button(scr, "Leave it out", bl_leave_out, false));
+}
+
+static void rcheck_cb(lv_event_t *e) {
+	int i = (int)(intptr_t)lv_event_get_user_data(e);
+	lv_obj_t *c = lv_event_get_target(e);
+	bool on = lv_obj_has_state(c, LV_STATE_CHECKED);
+	if (strcmp(rparts[i].name, "uboot") == 0 && !rsel[i]) {
+		lv_obj_remove_state(c, LV_STATE_CHECKED); // until the warning says otherwise
+		if (on && !bl_pending) {
+			bl_pending = true;
+			lv_async_call(bl_warning, (void *)(intptr_t)i);
+		}
+		return;
+	}
+	rsel[i] = on;
 }
 
 static lv_obj_t *check(const char *text, bool on) {
@@ -613,9 +642,16 @@ static void show_restore_parts(void) {
 	backup_entry_t *b = &backups[cur_backup];
 	page("Restore backup");
 	back_to = show_restore_list;
-	label(scr, b->name, F24, S.accent);
+	label(scr, b->name, F24, S.accent_text);
 	n_rparts = restore_scan(b->dir, rparts, RESTORE_MAX_PARTS);
-	lv_obj_t *first = NULL;
+	if (!rsel_valid) { // the defaults: kernel and system, never the bootloader
+		for (int i = 0; i < n_rparts; i++) {
+			rsel[i] = rparts[i].restorable && rparts[i].default_on && strcmp(rparts[i].name, "uboot") != 0;
+		}
+		rsel_valid = true;
+		rfocus = -1;
+	}
+	lv_obj_t *first = NULL, *focus = NULL;
 	char text[128];
 	for (int i = 0; i < n_rparts; i++) {
 		rchecks[i] = NULL;
@@ -627,22 +663,39 @@ static void show_restore_parts(void) {
 					 rparts[i].size >> 10);
 		}
 		if (rparts[i].restorable) {
-			rchecks[i] = check(text, rparts[i].default_on);
+			rchecks[i] = check(text, rsel[i]);
+			lv_obj_add_event_cb(rchecks[i], rcheck_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
 			if (!first) {
 				first = rchecks[i];
 			}
+			if (i == rfocus) {
+				focus = rchecks[i];
+			}
 		}
 	}
+	// What cannot be restored here: the running recovery's partitions on one
+	// short line, anything else with its reason.
+	char fb[128] = "";
 	for (int i = 0; i < n_rparts; i++) {
-		if (!rparts[i].restorable) {
-			snprintf(text, sizeof(text), "%s (mtd%d): %s", part_title(&rparts[i]), rparts[i].num,
-					 rparts[i].why_not);
+		if (rparts[i].restorable) {
+			continue;
+		}
+		if (strstr(rparts[i].why_not, "fastboot")) { // kernel2, the second rootfs
+			size_t l = strlen(fb);
+			snprintf(fb + l, sizeof(fb) - l, "%s%s", l ? "/" : "",
+					 strcmp(rparts[i].name, "kernel2") == 0 ? "kernel" : rparts[i].name);
+		} else {
+			snprintf(text, sizeof(text), "%s: %s", part_title(&rparts[i]), rparts[i].why_not);
 			label(scr, text, F20, S.dim);
 		}
 	}
+	if (fb[0]) {
+		snprintf(text, sizeof(text), "Fastboot only: recovery %s", fb);
+		label(scr, text, F20, S.dim);
+	}
 	lv_obj_t *go = button(scr, "Restore", confirm_restore, true);
 	button(scr, "Cancel", show_restore_list, false);
-	lv_group_focus_obj(first ? first : go);
+	lv_group_focus_obj(focus ? focus : first ? first : go);
 }
 
 static void pick_backup(void *idx_p) {
@@ -658,6 +711,7 @@ static void pick_backup(void *idx_p) {
 		show_message("Restore backup", msg);
 		return;
 	}
+	rsel_valid = false; // a backup picked from the list: its defaults
 	show_restore_parts();
 }
 
@@ -672,11 +726,11 @@ static void show_restore_list(void) {
 	back_to = show_advanced;
 	if (n_backups <= 0) {
 		show_message("Restore backup", n_backups < 0 ? "No microSD card could be read (FAT32 or exFAT)."
-													 : "There is no sonix-backup folder in the top of the card. "
+													 : "There is no zees-backup folder in the top of the card. "
 													   "Make one with \"Back up partitions\".");
 		return;
 	}
-	lv_label_set_text(l, "Choose a backup (sonix-backup folders on the card):");
+	lv_label_set_text(l, "Choose a backup (zees-backup folders on the card):");
 	lv_obj_t *first = NULL;
 	for (int i = 0; i < n_backups; i++) {
 		lv_obj_t *b = button(scr, "", NULL, false);
@@ -747,6 +801,25 @@ static void show_reset(void) {
 // ---------------------------------------------------------------------------
 // Main screen
 
+// "inserted, 32 GB": the card's capacity in decimal units, as cards are sold
+// (a 32 GB card is 31.9e9 bytes and reads 32 GB); one decimal below 10 GB.
+static void card_status(char *out, size_t size) {
+	if (!storage_card_present()) {
+		snprintf(out, size, "none");
+		return;
+	}
+	long long bytes = storage_card_size();
+	if (bytes <= 0) {
+		snprintf(out, size, "inserted");
+	} else if (bytes < 1000000000LL) {
+		snprintf(out, size, "inserted, %lld MB", (bytes + 500000) / 1000000);
+	} else if (bytes < 10000000000LL) {
+		snprintf(out, size, "inserted, %.1f GB", (double)bytes / 1e9);
+	} else {
+		snprintf(out, size, "inserted, %lld GB", (bytes + 500000000) / 1000000000);
+	}
+}
+
 static void refresh_status(lv_timer_t *t) {
 	(void)t;
 	if (!lbl_boot) {
@@ -754,15 +827,14 @@ static void refresh_status(lv_timer_t *t) {
 	}
 	boot_target_t bt = bootflag_read();
 	lv_label_set_text_fmt(lbl_boot, "Next boot: %s", boot_target_name(bt));
+	char card[48];
+	card_status(card, sizeof(card));
+	lv_label_set_text_fmt(lbl_card, "Card: %s", card);
 	battery_t b;
 	battery_read(&b);
-	char batt[48];
-	if (b.capacity >= 0) {
-		snprintf(batt, sizeof(batt), "%d%%%s", b.capacity, b.charging ? ", charging" : "");
-	} else {
-		snprintf(batt, sizeof(batt), "unknown");
+	if (bat_icon) {
+		battery_widget_set(bat_icon, b.capacity, b.charging);
 	}
-	lv_label_set_text_fmt(lbl_card, "Card: %s    Battery: %s", storage_card_present() ? "inserted" : "none", batt);
 }
 
 // False, with the reason on screen, when the battery is too low for an
@@ -810,7 +882,7 @@ static void browser_up(void) {
 	} else if (browse_rel[0]) {
 		browse_rel[0] = '\0';
 	} else {
-		show_main();
+		show_advanced();
 		return;
 	}
 	show_browser();
@@ -870,7 +942,7 @@ static void show_browser(void) {
 	page("Choose a file");
 	on_browser = true;
 	back_to = show_browser; // a confirmation's Cancel comes back to this folder
-	lv_obj_t *path = label(scr, title, F24, S.accent);
+	lv_obj_t *path = label(scr, title, F24, S.accent_text);
 	lv_refr_now(NULL);
 	n_files = update_list_dir(browse_rel, files, MAX_UPT_FILES);
 	if (n_files < 0) {
@@ -879,7 +951,7 @@ static void show_browser(void) {
 			show_browser();
 			return;
 		}
-		back_to = show_main;
+		back_to = show_advanced;
 		show_message("Choose a file", "No microSD card could be read (FAT32 or exFAT).");
 		return;
 	}
@@ -905,13 +977,13 @@ static void show_browser(void) {
 	if (n_files == MAX_UPT_FILES) {
 		label(scr, "(only the first ones are shown)", F20, S.dim);
 	}
-	lv_obj_t *back = button(scr, "Back", show_main, false);
+	lv_obj_t *back = button(scr, "Back", show_advanced, false);
 	lv_group_focus_obj(first ? first : back);
 	(void)path;
 }
 
 static void fastboot(void) {
-	confirm("Fastboot", "Reboots into USB fastboot (Sonix bootloader).",
+	confirm("Fastboot", "Reboots into USB fastboot (Zee's bootloader).",
 			"Reboot to fastboot", reboot_fastboot);
 }
 
@@ -924,17 +996,19 @@ static void adb(void) {
 }
 
 static void show_main(void) {
-	page("Sonix Recovery");
+	page("Zee's Recovery");
+	lv_obj_set_style_text_color(lv_obj_get_child(scr, 0), S.accent_text, 0); // the title, in the accent
 	back_allowed = false;
 	back_to = show_main;
-	// Six rows as tall as the screen leaves room for: about 90 px on the R1's
-	// 800 lines, 80 on the R3 Pro II's 720 (the player's rows are 100).
+	// Five rows as tall as the screen leaves room for, up to the player's 100
+	// px (about 109 on the R1's 800 lines and 97 on the R3 Pro II's 720 before
+	// the cap).
 	int32_t vres = lv_display_get_vertical_resolution(lv_obj_get_display(scr));
-	btn_height = (vres - 196) / 6 - 8;
+	btn_height = (vres - 196) / 5 - 8;
 	btn_height = btn_height > 100 ? 100 : btn_height < 64 ? 64 : btn_height;
 	lv_obj_set_style_pad_row(scr, 8, 0);
 	char head[96];
-	snprintf(head, sizeof(head), "%s  %s", g_model.name, SONIX_RECOVERY_VERSION);
+	snprintf(head, sizeof(head), "%s  %s", g_model.name, ZEES_RECOVERY_VERSION);
 	label(scr, head, F20, S.dim);
 
 	lv_obj_t *st = column(scr);
@@ -942,13 +1016,18 @@ static void show_main(void) {
 	lbl_boot = label(st, "", F20, S.dim);
 	lbl_card = label(st, "", F20, S.dim);
 
+	// The battery, as the player's top bar draws it, in the title's corner:
+	// floating, so the column's layout leaves it alone.
+	bat_icon = battery_widget_create(scr);
+	lv_obj_set_floating(bat_icon, true);
+	lv_obj_align(bat_icon, LV_ALIGN_TOP_RIGHT, 0, (lv_font_get_line_height(F32) - 38) / 2);
+
 	char install_txt[64];
 	snprintf(install_txt, sizeof(install_txt), "Install %s.upt", g_model.upt_stem);
 	lv_obj_t *first = row(scr, install_txt, install, false);
-	row(scr, "Choose file on card", open_browser, true);
-	row(scr, "Reboot to system", reboot_system, false);
 	row(scr, "Factory reset", show_reset, true);
 	row(scr, "Advanced", show_advanced, true);
+	row(scr, "Reboot to system", reboot_system, false);
 	row(scr, "Power off", poweroff, false);
 	lv_group_focus_obj(first);
 
@@ -965,10 +1044,11 @@ static void show_advanced(void) {
 	// Results of the buttons that stay on this screen (Start ADB).
 	lbl_note = label(scr, "", F20, S.warn);
 	lv_obj_set_hidden(lbl_note, true);
-	lv_obj_t *first = row(scr, "Back up partitions", show_backup, true);
+	lv_obj_t *first = row(scr, "Choose file on card", open_browser, true);
+	row(scr, "Back up partitions", show_backup, true);
 	row(scr, "Restore backup", show_restore_list, true);
-	// Fastboot needs the Sonix bootloader: with HiBy's the request is ignored.
-	if (bootloader_is_sonix()) {
+	// Fastboot needs Zee's bootloader: with HiBy's the request is ignored.
+	if (bootloader_is_zees()) {
 		row(scr, "Reboot to fastboot", fastboot, true);
 	} else if (bootloader_can_install()) {
 		row(scr, "Install fastboot", confirm_bootloader, true);

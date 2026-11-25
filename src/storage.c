@@ -17,6 +17,20 @@ static const char *const CANDIDATES[] = {
 static const char *const FSTYPES[] = {"vfat", "exfat"};
 
 static bool mounted_here;
+static char cur_mnt[256]; // where the card is mounted, "" when it is not
+
+static int remount(const char *dir, bool rw) {
+	if (!rw) {
+		sync();
+	}
+	unsigned long flags = MS_REMOUNT | MS_NOATIME | (rw ? 0 : MS_RDONLY);
+	if (mount(NULL, dir, NULL, flags, NULL) != 0) {
+		LOG("storage: remount %s %s: %s", dir, rw ? "rw" : "ro", strerror(errno));
+		return -1;
+	}
+	LOG("storage: %s %s", dir, rw ? "writable" : "read-only");
+	return 0;
+}
 
 bool storage_card_present(void) {
 	for (size_t i = 0; i < sizeof(CANDIDATES) / sizeof(CANDIDATES[0]); i++) {
@@ -25,6 +39,29 @@ bool storage_card_present(void) {
 		}
 	}
 	return false;
+}
+
+long long storage_card_size(void) {
+	static const char *const DISKS[] = {"mmcblk0", "mmcblk1"};
+	for (size_t i = 0; i < sizeof(DISKS) / sizeof(DISKS[0]); i++) {
+		char p[64];
+		snprintf(p, sizeof(p), "/dev/%s", DISKS[i]);
+		if (access(p, F_OK) != 0) {
+			continue;
+		}
+		snprintf(p, sizeof(p), "/sys/block/%s/size", DISKS[i]);
+		FILE *f = fopen(p, "r");
+		if (!f) {
+			continue;
+		}
+		long long sectors = -1;
+		int ok = fscanf(f, "%lld", &sectors) == 1;
+		fclose(f);
+		if (ok && sectors > 0) {
+			return sectors * 512; // always 512-byte units in sysfs
+		}
+	}
+	return -1;
 }
 
 // Where a /dev/mmcblk* is already mounted, if it is.
@@ -49,6 +86,8 @@ static int find_existing(char *mnt, size_t mnt_size) {
 int storage_mount(int timeout_s, char *mnt, size_t mnt_size) {
 	if (find_existing(mnt, mnt_size) == 0) {
 		LOG("storage: card already mounted at %s", mnt);
+		snprintf(cur_mnt, sizeof(cur_mnt), "%s", mnt);
+		remount(mnt, false); // whoever mounted it, read-only from here on
 		return 0;
 	}
 	mkdir("/tmp/mnt", 0755);
@@ -65,9 +104,10 @@ int storage_mount(int timeout_s, char *mnt, size_t mnt_size) {
 			}
 			any = true;
 			for (size_t t = 0; t < sizeof(FSTYPES) / sizeof(FSTYPES[0]); t++) {
-				if (mount(CANDIDATES[i], SD_MOUNT, FSTYPES[t], MS_NOATIME, NULL) == 0) {
-					LOG("storage: %s (%s) mounted at %s", CANDIDATES[i], FSTYPES[t], SD_MOUNT);
+				if (mount(CANDIDATES[i], SD_MOUNT, FSTYPES[t], MS_NOATIME | MS_RDONLY, NULL) == 0) {
+					LOG("storage: %s (%s) mounted read-only at %s", CANDIDATES[i], FSTYPES[t], SD_MOUNT);
 					mounted_here = true;
+					snprintf(cur_mnt, sizeof(cur_mnt), "%s", SD_MOUNT);
 					snprintf(mnt, mnt_size, "%s", SD_MOUNT);
 					return 0;
 				}
@@ -83,13 +123,27 @@ int storage_mount(int timeout_s, char *mnt, size_t mnt_size) {
 	return -1;
 }
 
+int storage_set_writable(bool rw) {
+	if (!cur_mnt[0]) {
+		LOG("storage: no card mounted to make %s", rw ? "writable" : "read-only");
+		return -1;
+	}
+	return remount(cur_mnt, rw);
+}
+
 void storage_unmount(void) {
 	sync();
+	if (cur_mnt[0]) {
+		remount(cur_mnt, false); // a card left mounted (not ours) stays read-only
+	}
 	if (mounted_here) {
 		if (umount(SD_MOUNT) == 0) {
 			mounted_here = false;
 		} else {
 			LOG("storage: umount %s: %s", SD_MOUNT, strerror(errno));
 		}
+	}
+	if (!mounted_here) {
+		cur_mnt[0] = '\0';
 	}
 }

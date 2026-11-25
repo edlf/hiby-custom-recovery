@@ -5,11 +5,11 @@
 
 // The "uboot" partition (mtd0): the SPL the boot ROM loads, and U-Boot.
 //
-// Sonix's (uboot/ in the tree) is told from HiBy's by the string
+// Zee's bootloader (uboot/ in the tree) is told from HiBy's by the string
 // "ota:fastboot", the fastboot request its SPL and U-Boot both look for
 // (device.h); the stock loader has no fastboot at all. Without it, "Reboot to
 // fastboot" would just start the system, so the menu offers it only with
-// the Sonix loader, and otherwise offers to install it (on the models where
+// Zee's bootloader, and otherwise offers to install it (on the models where
 // that is allowed, model.h) from the copy pack_recovery.sh puts in the
 // recovery root fs at BOOTLOADER_DIR/<model's image>, with its .md5 beside.
 //
@@ -28,10 +28,10 @@
 // The boot ROM has no fallback: a partition without a working SPL can only
 // be fixed with Ingenic's USB boot mode, hence the checks and step 5.
 
-#define BOOTLOADER_DIR "/usr/share/sonix-recovery"
+#define BOOTLOADER_DIR "/usr/share/zees-recovery"
 
 // Reads the partition (once; again after an install).
-bool bootloader_is_sonix(void);
+bool bootloader_is_zees(void);
 // The bundled image is there and this model may install it.
 bool bootloader_can_install(void);
 

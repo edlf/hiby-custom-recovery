@@ -5,18 +5,20 @@
 
 // Copies the flash partitions, raw, to a new folder on the card:
 //
-//   sonix-backup-20261125-1840/      (sonix-backup-N when the clock is unset)
+//   zees-backup-20261125-1840/      (zees-backup-N when the clock is unset)
 //     mtd0-uboot.bin ... mtd6-userdata.bin   one per partition, its full size
 //     mtd.txt         the partition table as /proc/mtd gave it
 //     md5sums.txt     md5sum -c on a PC checks the copies
 //     info.txt        model, recovery version, and per partition the bad
 //                     blocks (written as 0xff) and uncorrectable ECC errors
 //
-// Each partition is read erase block by erase block (ECC corrected), its md5
-// computed on the way, and the file on the card read back afterwards and
-// checked against that md5. Bad blocks are not read, they are written as
-// 0xff, as nanddump does. An uncorrectable ECC error does not stop the copy:
-// the data is kept, and the partition is flagged in info.txt and on screen.
+// Each partition is read with nanddump --bb=padbad (ECC corrected, device.h),
+// its md5 computed on the way, and the file on the card read back afterwards
+// and checked against that md5. Bad blocks come out as 0xff in their place,
+// so every block is at its offset. An uncorrectable ECC error does not stop
+// the copy: the data is kept, and the partition is flagged in info.txt and on
+// screen. A block nanddump cannot read at all is written as 0xff, counted as
+// a read error, and the copy goes on from the next block.
 //
 // userdata (UBI, /usr/data) is mounted while it is read; nothing in the
 // recovery writes to it in the meantime.
