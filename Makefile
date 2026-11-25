@@ -69,6 +69,16 @@ $(error MODEL must be r1 or r3proii)
 endif
 
 VERSION := $(shell git -C $(CURDIR) describe --always --dirty 2>/dev/null || echo unknown)
+# The version is passed with -D, which make does not see as an input: it is
+# also kept in build/version.txt, rewritten only when it changes, and the
+# files that print it depend on that (below), so a new commit rebuilds them.
+VERSION_STAMP = build/version.txt
+ifeq ($(filter clean distclean,$(MAKECMDGOALS)),)
+ifneq ($(file < $(VERSION_STAMP)),$(VERSION))
+$(shell mkdir -p build)
+$(file > $(VERSION_STAMP),$(VERSION))
+endif
+endif
 
 # -march=mips32r2: the toolchain is configured without --with-arch.
 # -mno-madd4: the X1600 has no fused multiply-add (madd.s/msub.s would trap).
@@ -227,5 +237,9 @@ clean:
 
 distclean: clean
 	rm -rf $(DEPS)
+
+# The sources that print the version (ZEES_RECOVERY_VERSION).
+VERSIONED = main backup ui
+$(VERSIONED:%=$(BUILD)/%.o) $(VERSIONED:%=$(HOST_BUILD_DIR)/%.o): $(VERSION_STAMP)
 
 -include $(APP_OBJS:.o=.d) $(LVGL_OBJS:.o=.d) $(HOST_OBJS:.o=.d) $(HOST_LVGL_OBJS:.o=.d)
