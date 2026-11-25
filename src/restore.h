@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Writes partitions back from a backup made by backup.h (a sonix-backup-*
+// Writes partitions back from a backup made by backup.h (a zees-backup-*
 // folder in the top of the card).
 //
 // Not offered: kernel2 and the second rootfs, the recovery that is running
@@ -17,12 +17,13 @@
 //   - each chosen partition: a block gone bad since the backup that held
 //     data in it refuses the partition (the data would land elsewhere)
 //   - userdata: /usr/data unmounted and its UBI detached
-// Then each partition is written block by block, at the offsets the backup
-// read it from: bad blocks skipped, every block erased, pages that are all
-// 0xff left erased (UBI wants empty pages empty, not written with 0xff).
-// Every block is read back and compared. The bootloader's current contents
-// are kept in RAM and written back if its read back fails; the others are
-// written once more.
+// Then each partition is written with the mtd-utils, at the offsets the
+// backup read it from: flash_erase, then nandwrite -k (pages that are all 0xff
+// left erased, as UBI wants them) fed the backup without the blocks that are
+// bad now, which nandwrite skips. Then it is read back with nanddump and
+// compared block by block. The bootloader's current contents (read the same
+// way) are kept in RAM and written back if its read back fails; the others
+// are written once more.
 
 #define RESTORE_MAX_PARTS 16
 
@@ -35,7 +36,7 @@ typedef struct {
 	long long bytes;
 } backup_entry_t;
 
-// The card's sonix-backup-* folders, newest name first. -1 without a card.
+// The card's zees-backup-* folders, newest name first. -1 without a card.
 int restore_list_backups(backup_entry_t *out, int max);
 
 typedef struct {

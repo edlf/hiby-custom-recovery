@@ -4,6 +4,7 @@
 #include "log.h"
 #include "md5.h"
 #include "model.h"
+#include "squashfs.h"
 #include "storage.h"
 
 #include <dirent.h>
@@ -20,8 +21,8 @@
 #include <unistd.h>
 
 // On the PC (make host, see sim_device.c) the package is unpacked with 7z
-// instead of loop-mounted, and the writing is simulated; the checks are the
-// real ones.
+// instead of loop-mounted, and flash_erase/nandwrite are stood in for by
+// sim_device.c's mtd_image_*; everything else is the real code.
 #ifdef HOST_BUILD
 #define UPT_MOUNT "/tmp/sonix-sim-upt"
 #else
@@ -147,63 +148,312 @@ static int parse_images(const char *path, image_t *img, int max) {
 }
 
 
-// The chunks <name>.NNNN.<md5> in `dir`: their total size, and whether they
-// are numbered 0..count-1 with none missing.
-static long long chunks_size(const char *dir, const char *name, int *count) {
-	DIR *d = opendir(dir);
-	if (!d) {
+// The chunks of an image: <name>.0000.<img_md5>, then each one named after
+// the md5 of the one before it (<name>.0001.<md5 of chunk 0>, ...), every one
+// 512 KiB but the last. ota_md5_<name>.<img_md5> has their md5s, one per line.
+#define MAX_CHUNKS 4096
+#define CHUNK_BUF (64 * 1024)
+
+static int read_md5_list(const char *dir, const image_t *im, char (*list)[33], int max) {
+	char path[512];
+	snprintf(path, sizeof(path), "%s/ota_md5_%s.%s", dir, im->name, im->md5);
+	FILE *f = fopen(path, "r");
+	if (!f) {
 		return -1;
 	}
-	size_t nl = strlen(name);
-	long long total = 0;
-	int n = 0, max_idx = -1;
-	struct dirent *e;
-	char path[512];
-	while ((e = readdir(d))) {
-		int idx;
-		char rest[64];
-		if (strncmp(e->d_name, name, nl) != 0 || e->d_name[nl] != '.' ||
-			sscanf(e->d_name + nl + 1, "%4d.%63s", &idx, rest) != 2 || strlen(rest) != 32) {
-			continue;
-		}
-		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-		struct stat st;
-		if (stat(path, &st) != 0) {
-			closedir(d);
-			return -1;
-		}
-		total += st.st_size;
-		n++;
-		if (idx > max_idx) {
-			max_idx = idx;
+	char line[128];
+	int n = 0;
+	while (n < max && fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "%32s", list[n]) == 1 && strlen(list[n]) == 32) {
+			n++;
 		}
 	}
-	closedir(d);
-	*count = (max_idx + 1 == n) ? n : -1;
-	return total;
+	fclose(f);
+	return n;
 }
 
-// md5 of the chunks joined in order. The names have a fixed-width index right
-// after the image name, so the shell's sorted glob is the right order.
-// With tee_to, the joined image is also written there, in the same pass.
-static int chunks_md5(const char *dir, const char *name, const char *tee_to, char out[33]) {
-	char cmd[1024], q[600];
-	if (tee_to) {
-		snprintf(cmd, sizeof(cmd), "cat %s/%s.[0-9][0-9][0-9][0-9].* | tee %s | md5sum", dir, name,
-				 shq(tee_to, q, sizeof(q)));
-	} else {
-		snprintf(cmd, sizeof(cmd), "cat %s/%s.[0-9][0-9][0-9][0-9].* | md5sum", dir, name);
+// CRC-32 (IEEE, as zlib and U-Boot have it), fed in pieces.
+static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n) {
+	static uint32_t table[256];
+	if (!table[1]) {
+		for (uint32_t i = 0; i < 256; i++) {
+			uint32_t c = i;
+			for (int k = 0; k < 8; k++) {
+				c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
+			}
+			table[i] = c;
+		}
 	}
-	FILE *p = popen(cmd, "r");
-	if (!p) {
+	crc = ~crc;
+	while (n--) {
+		crc = table[(crc ^ *p++) & 0xff] ^ (crc >> 8);
+	}
+	return ~crc;
+}
+
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+// The kernel has to be a uImage the SPL can boot: it reads the legacy header,
+// copies header + data to load - 64 and jumps to the entry point without
+// checking anything (a bad one leaves the player hanging at power-on). The
+// same rules as fastboot's fb_check_kernel_image() (uboot/): magic, header
+// and data CRC, Linux/MIPS/kernel/uncompressed, inside RAM above the SPL
+// (0x80008000 up to the 64 MiB the boot gives Linux), entry inside the image.
+#define UIMAGE_HDR 64
+#define SPL_RAM_START 0x80008000u
+#define RAM_END (0x80000000u + (64u << 20))
+
+typedef struct {
+	uint8_t hdr[UIMAGE_HDR];
+	size_t have;	   // header bytes seen
+	long long data;	   // data bytes seen
+	uint32_t dcrc;	   // CRC of the data so far
+} uimage_check_t;
+
+static void uimage_feed(uimage_check_t *u, const uint8_t *p, size_t n) {
+	if (u->have < UIMAGE_HDR) {
+		size_t k = UIMAGE_HDR - u->have < n ? UIMAGE_HDR - u->have : n;
+		memcpy(u->hdr + u->have, p, k);
+		u->have += k;
+		p += k;
+		n -= k;
+	}
+	if (u->have == UIMAGE_HDR && n > 0) {
+		long long want = (long long)be32(u->hdr + 12) - u->data; // ih_size
+		size_t k = want > 0 ? (want < (long long)n ? (size_t)want : n) : 0;
+		u->dcrc = crc32_update(u->dcrc, p, k);
+		u->data += (long long)k;
+	}
+}
+
+static int uimage_ok(const uimage_check_t *u, char *why, size_t why_size) {
+	const uint8_t *h = u->hdr;
+	if (u->have < UIMAGE_HDR || be32(h) != 0x27051956u) {
+		snprintf(why, why_size, "The kernel is not a uImage (bad magic).");
 		return -1;
 	}
-	char line[128] = {0};
-	char *r = fgets(line, sizeof(line), p);
-	int rc = pclose(p);
-	if (!r || rc != 0 || sscanf(line, "%32s", out) != 1) {
+	uint8_t copy[UIMAGE_HDR];
+	memcpy(copy, h, sizeof(copy));
+	memset(copy + 4, 0, 4); // ih_hcrc counts as 0
+	if (crc32_update(0, copy, sizeof(copy)) != be32(h + 4)) {
+		snprintf(why, why_size, "The kernel's uImage header is corrupt (checksum).");
 		return -1;
 	}
+	uint32_t size = be32(h + 12), load = be32(h + 16), ep = be32(h + 20);
+	if (u->data != (long long)size) {
+		snprintf(why, why_size, "The kernel is truncated (%lld of %u data bytes).", u->data, size);
+		return -1;
+	}
+	if (u->dcrc != be32(h + 24)) {
+		snprintf(why, why_size, "The kernel's data is corrupt (uImage checksum).");
+		return -1;
+	}
+	if (h[28] != 5 || h[29] != 5 || h[30] != 2 || h[31] != 0) { // os, arch, type, comp
+		snprintf(why, why_size, "The kernel is not one the bootloader can start (os/arch/type/comp %d/%d/%d/%d, "
+								"needs 5/5/2/0).",
+				 h[28], h[29], h[30], h[31]);
+		return -1;
+	}
+	uint64_t start = (uint64_t)load - UIMAGE_HDR, end = (uint64_t)load + size;
+	if (load < UIMAGE_HDR || start < SPL_RAM_START || end > RAM_END) {
+		snprintf(why, why_size, "The kernel loads at 0x%08x, outside the RAM the bootloader can use.", load);
+		return -1;
+	}
+	if (ep < load || (uint64_t)ep >= end) {
+		snprintf(why, why_size, "The kernel's entry point 0x%08x is outside it.", ep);
+		return -1;
+	}
+	return 0;
+}
+
+// The chunk file names, in order: <name>.0000.<img_md5>, then each named
+// after the md5 the list gives the chunk before it. `n` from read_md5_list().
+static void chunk_path(const char *dir, const image_t *im, char (*list)[33], int i, char *out, size_t size) {
+	snprintf(out, size, "%s/%s.%04d.%s", dir, im->name, i, i == 0 ? im->md5 : list[i - 1]);
+}
+
+// One pass over an image's chunks, in order: each chunk's md5 against the
+// list, the size, and the md5 of them all against img_md5. With `w`, the data
+// also goes to the writer as it is read, and progress is shown out of
+// `total` bytes, `base` of them already done. 0 when all is right; otherwise
+// the reason in `why`. A chunk that fails its md5 is never written: the
+// writer only ever gets chunks that passed.
+static int chunk_pass(const char *dir, const image_t *im, mtd_image_writer_t *w, long long base, long long total,
+					  char *why, size_t why_size) {
+	static char list[MAX_CHUNKS][33];
+	int n = read_md5_list(dir, im, list, MAX_CHUNKS);
+	if (n <= 0) {
+		snprintf(why, why_size, "%s: no chunk md5 list (ota_md5_%s.%s).", im->name, im->name, im->md5);
+		return -1;
+	}
+	uint8_t *buf = malloc(CHUNK_BUF);
+	uint8_t *chunk = malloc(1 << 20); // one chunk, checked before any of it is written
+	if (!buf || !chunk) {
+		free(buf);
+		free(chunk);
+		snprintf(why, why_size, "Out of memory.");
+		return -1;
+	}
+	md5_ctx all;
+	md5_init(&all);
+	bool is_kernel = strcmp(im->type, "kernel") == 0;
+	uimage_check_t uck;
+	memset(&uck, 0, sizeof(uck));
+	char prev[33];
+	snprintf(prev, sizeof(prev), "%s", im->md5);
+	long long got = 0;
+	int rc = 0;
+	for (int i = 0; got < im->size; i++) {
+		if (i >= n) {
+			snprintf(why, why_size, "%s: chunk %d is not in the md5 list.", im->name, i);
+			rc = -1;
+			break;
+		}
+		char path[600];
+		snprintf(path, sizeof(path), "%s/%s.%04d.%s", dir, im->name, i, prev);
+		FILE *f = fopen(path, "rb");
+		if (!f) {
+			snprintf(why, why_size, "%s: chunk %d is missing.", im->name, i);
+			rc = -1;
+			break;
+		}
+		size_t len = fread(chunk, 1, 1 << 20, f);
+		bool too_big = len == (1 << 20) && fgetc(f) != EOF;
+		bool err = ferror(f);
+		fclose(f);
+		if (err || len == 0 || too_big) {
+			snprintf(why, why_size, "%s: chunk %d cannot be read.", im->name, i);
+			rc = -1;
+			break;
+		}
+		md5_ctx c;
+		md5_init(&c);
+		md5_update(&c, chunk, len);
+		md5_final_hex(&c, prev);
+		if (strcmp(prev, list[i]) != 0) {
+			snprintf(why, why_size, "%s is corrupt (chunk %d md5 mismatch). Copy the file to the card again.",
+					 im->name, i);
+			rc = -1;
+			break;
+		}
+		if (got + (long long)len > im->size) {
+			snprintf(why, why_size, "%s: the chunks are bigger than img_size (%lld bytes).", im->name, im->size);
+			rc = -1;
+			break;
+		}
+		md5_update(&all, chunk, len);
+		if (is_kernel) {
+			uimage_feed(&uck, chunk, len);
+			if (w && got == 0 && (uck.have < UIMAGE_HDR || be32(uck.hdr) != 0x27051956u)) {
+				// checked in full before anything was written; a card that now
+				// reads otherwise stops here, before the first byte goes in
+				snprintf(why, why_size, "The kernel is not a uImage (bad magic).");
+				rc = -1;
+				break;
+			}
+		}
+		if (w) {
+			for (size_t o = 0; o < len && rc == 0; o += CHUNK_BUF) {
+				size_t k = len - o < CHUNK_BUF ? len - o : CHUNK_BUF;
+				if (mtd_image_write(w, chunk + o, k) != 0) {
+					snprintf(why, why_size, "%s: nandwrite stopped taking data.", im->name);
+					rc = -1;
+				}
+			}
+			if (rc) {
+				break;
+			}
+		}
+		got += (long long)len;
+		set_percent((int)((base + got) * 100 / (total > 0 ? total : 1)));
+	}
+	if (rc == 0) {
+		char md5[33];
+		md5_final_hex(&all, md5);
+		if (strcmp(md5, im->md5) != 0) {
+			snprintf(why, why_size, "%s is corrupt (md5 mismatch). Copy the file to the card again.", im->name);
+			rc = -1;
+		} else if (is_kernel && uimage_ok(&uck, why, why_size) != 0) {
+			rc = -1;
+		}
+	}
+	free(buf);
+	free(chunk);
+	return rc;
+}
+
+// The system image as one stream over its chunk files, for squashfs.c: a
+// read at an offset of the image goes to the chunk(s) holding it.
+typedef struct {
+	char (*paths)[600];
+	long long *ends; // where each chunk ends in the image
+	int n;
+} chunk_image_t;
+
+static int chunk_image_read(void *ctx, uint64_t off, void *buf, size_t len) {
+	chunk_image_t *ci = ctx;
+	uint8_t *d = buf;
+	while (len > 0) {
+		int i = 0;
+		while (i < ci->n && (uint64_t)ci->ends[i] <= off) {
+			i++;
+		}
+		if (i == ci->n) {
+			return -1;
+		}
+		long long begin = i ? ci->ends[i - 1] : 0;
+		size_t k = (size_t)((uint64_t)ci->ends[i] - off) < len ? (size_t)((uint64_t)ci->ends[i] - off) : len;
+		FILE *f = fopen(ci->paths[i], "rb");
+		bool ok = f && fseeko(f, (off_t)(off - (uint64_t)begin), SEEK_SET) == 0 && fread(d, 1, k, f) == k;
+		if (f) {
+			fclose(f);
+		}
+		if (!ok) {
+			return -1;
+		}
+		d += k;
+		off += k;
+		len -= k;
+	}
+	return 0;
+}
+
+// Which player the system image is for: its /usr/resource/hostname, read
+// straight from the chunks with squashfs.c (a few metadata blocks and one
+// fragment; nothing is put together or copied anywhere). 0 when it names this
+// player; otherwise the reason in `why`, and *unknown set when it could not be
+// read at all.
+static int check_rootfs_model(const char *dir, const image_t *im, bool *unknown, char *why, size_t why_size) {
+	static char list[MAX_CHUNKS][33];
+	static char paths[MAX_CHUNKS][600];
+	static long long ends[MAX_CHUNKS];
+	*unknown = true;
+	int n = read_md5_list(dir, im, list, MAX_CHUNKS);
+	chunk_image_t ci = {paths, ends, 0};
+	long long at = 0;
+	for (int i = 0; i < n && at < im->size; i++) {
+		chunk_path(dir, im, list, i, paths[i], sizeof(paths[i]));
+		struct stat st;
+		if (stat(paths[i], &st) != 0) {
+			break;
+		}
+		at += st.st_size;
+		ends[i] = at;
+		ci.n = i + 1;
+	}
+	char host[128];
+	if (squashfs_read_file(chunk_image_read, &ci, "usr/resource/hostname", host, sizeof(host)) <= 0) {
+		snprintf(why, why_size, "the system image has no /usr/resource/hostname that can be read");
+		return -1;
+	}
+	*unknown = false;
+	host[strcspn(host, "\r\n")] = '\0';
+	if (strcmp(host, g_model.rootfs_hostname) != 0) {
+		snprintf(why, why_size, "This package is for another player: its system is a '%s', this is a %s.", host,
+				 g_model.name);
+		return -1;
+	}
+	LOG("update: the system image is a %s", host);
 	return 0;
 }
 
@@ -236,21 +486,7 @@ static bool upt_mounted;
 static image_t checked_img[MAX_IMAGES];
 static int n_checked;
 static char checked_dir[300];
-static bool ignore_compat; // update_start(): the user overrode the compatibility record
-
-// The rootfs image joined on the card, only for as long as the model check
-// takes: ~40 MB, more than the RAM can spare.
-#define ROOTFS_CHECK_NAME ".sonix_rootfs_check.squashfs"
-static char rootfs_check[512];
-
-static void remove_rootfs_check(void) {
-	if (rootfs_check[0]) {
-		unlink(rootfs_check);
-		rootfs_check[0] = '\0';
-	}
-}
-
-static void cleanup(const char *card) {
+static void cleanup(void) {
 	if (upt_mounted) {
 #ifdef HOST_BUILD
 		run("rm -rf " UPT_MOUNT);
@@ -261,38 +497,11 @@ static void cleanup(const char *card) {
 #endif
 		upt_mounted = false;
 	}
-	remove_rootfs_check();
-	if (card && card[0]) {
-		char dst[600], q[700];
-		snprintf(dst, sizeof(dst), "%s/sonix_recovery.log", card);
-		run("cp %s %s", LOG_FILE, shq(dst, q, sizeof(q)));
-	}
 	storage_unmount();
 }
 
-// The model check: the system image's /usr/resource/hostname must name this
-// player. Every package seen so far carries it, stock and Sonix ("HiBy R1",
-// "HiBy R3PROII"); one that does not is refused, as there is then nothing
-// that says which player it is for.
-static int check_rootfs_model(const char *image) {
-	char buf[128];
-	int n = squashfs_read_file(image, "usr/resource/hostname", buf, sizeof(buf));
-	if (n < 0) {
-		finish(UPDATE_FAILED, "The system image cannot be read to tell which player it is for.");
-		return -1;
-	}
-	buf[strcspn(buf, "\r\n")] = '\0';
-	if (strcmp(buf, g_model.rootfs_hostname) != 0) {
-		finish(UPDATE_FAILED, "This package is for another player: its system is a '%s', this is a %s.", buf,
-			   g_model.name);
-		return -1;
-	}
-	LOG("update: the system image is a %s", buf);
-	return 0;
-}
-
 // Checks the package. 0 when it can be written.
-static int check_package(char *dir, size_t dir_size, const char *card) {
+static int check_package(char *dir, size_t dir_size) {
 	char v[128];
 	if (file_key(UPT_MOUNT "/ota_config.in", "current_version", v, sizeof(v)) != 0 || !v[0]) {
 		finish(UPDATE_FAILED, "Not a firmware package: no ota_config.in.");
@@ -308,20 +517,20 @@ static int check_package(char *dir, size_t dir_size, const char *card) {
 		return -1;
 	}
 
+	// The compatibility record is the only thing that says which player the
+	// package is for.
 	snprintf(path, sizeof(path), "%s/ota_compatibility.in", dir);
-	// The record is judged only after the system image has been looked at:
-	// another player's package is then refused naming that player, and the
-	// override (ignore_compat) is offered only for a package whose system is
-	// this player's and whose record alone disagrees.
-	char compat_problem[160] = "";
 	if (file_key(path, "compatibility", v, sizeof(v)) == 0) {
 		if (strncmp(v, g_model.compat, strlen(g_model.compat)) != 0) {
-			snprintf(compat_problem, sizeof(compat_problem), "Its compatibility record says '%s'.", v);
-		} else {
-			LOG("update: compatibility %s", v);
+			finish(UPDATE_FAILED, "This package is not for the %s: its compatibility record says '%s'.",
+				   g_model.name, v);
+			return -1;
 		}
+		LOG("update: compatibility %s", v);
 	} else if (g_model.compat_needed) {
-		snprintf(compat_problem, sizeof(compat_problem), "It has no compatibility record.");
+		finish(UPDATE_FAILED, "This package has no compatibility record, so nothing says it is for the %s.",
+			   g_model.name);
+		return -1;
 	}
 
 	image_t img[MAX_IMAGES];
@@ -331,19 +540,29 @@ static int check_package(char *dir, size_t dir_size, const char *card) {
 		finish(UPDATE_FAILED, "The package lists no images (ota_update.in).");
 		return -1;
 	}
+	if (file_key(path, "ota_version", v, sizeof(v)) == 0 && atoi(v) != ver) {
+		finish(UPDATE_FAILED, "The package is inconsistent: ota_update.in is for version %s, not %d.", v, ver);
+		return -1;
+	}
+	int seen_kernel = 0, seen_rootfs = 0;
 
-	int rootfs_seen = 0;
 	for (int i = 0; i < n; i++) {
 		const char *part;
 		if (strcmp(img[i].type, "kernel") == 0) {
 			part = "kernel";
+			seen_kernel++;
 		} else if (strcmp(img[i].type, "rootfs") == 0) {
 			part = "rootfs"; // the first one: the normal system's
+			seen_rootfs++;
 		} else {
 			finish(UPDATE_FAILED, "Unsupported image type '%s'.", img[i].type);
 			return -1;
 		}
-		if (!img[i].name[0] || img[i].size <= 0 || strlen(img[i].md5) != 32) {
+		if (seen_kernel > 1 || seen_rootfs > 1) {
+			finish(UPDATE_FAILED, "ota_update.in lists the %s twice.", part);
+			return -1;
+		}
+		if (!img[i].name[0] || strchr(img[i].name, '/') || img[i].size <= 0 || strlen(img[i].md5) != 32) {
 			finish(UPDATE_FAILED, "Image %d in ota_update.in is incomplete.", i);
 			return -1;
 		}
@@ -359,55 +578,27 @@ static int check_package(char *dir, size_t dir_size, const char *card) {
 		char phase[64];
 		snprintf(phase, sizeof(phase), "Checking %s", img[i].name);
 		set_phase(phase, (i * 100) / n);
-		int count = 0;
-		long long csize = chunks_size(dir, img[i].name, &count);
-		if (csize != img[i].size || count <= 0) {
-			finish(UPDATE_FAILED, "%s: chunks missing or wrong size (%lld of %lld bytes).", img[i].name, csize,
-				   img[i].size);
+		char why[200];
+		if (chunk_pass(dir, &img[i], NULL, 0, img[i].size, why, sizeof(why)) != 0) {
+			finish(UPDATE_FAILED, "%s", why);
 			return -1;
 		}
-		bool is_rootfs = strcmp(img[i].type, "rootfs") == 0;
-		if (is_rootfs) {
-			snprintf(rootfs_check, sizeof(rootfs_check), "%s/" ROOTFS_CHECK_NAME, card);
-		}
-		char md5[33];
-		if (chunks_md5(dir, img[i].name, is_rootfs ? rootfs_check : NULL, md5) != 0) {
-			finish(UPDATE_FAILED, is_rootfs ? "%s cannot be read, or the card has no room for the check "
-											  "(it needs about 50 MB free)."
-											: "%s cannot be read.",
-				   img[i].name);
-			return -1;
-		}
-		if (strcmp(md5, img[i].md5) != 0) {
-			finish(UPDATE_FAILED, "%s is corrupt (md5 mismatch). Copy the file to the card again.", img[i].name);
-			return -1;
-		}
-		if (is_rootfs) {
+		LOG("update: %s: %lld bytes, every chunk's md5 and the whole md5 ok, fits %s (%lld bytes)", img[i].name,
+			img[i].size, dev, psize);
+		if (strcmp(img[i].type, "rootfs") == 0) {
+			// Which player it is for, from the system itself. Another player's
+			// system is always refused. When it cannot be read, the R1's
+			// compatibility record (checked above, required) still decides;
+			// the R3 Pro II's packages have none, so there nothing would.
 			set_phase("Checking which player it is for", -1);
-			int rc = check_rootfs_model(rootfs_check);
-			remove_rootfs_check();
-			if (rc != 0) {
-				return -1;
+			bool unknown;
+			if (check_rootfs_model(dir, &img[i], &unknown, why, sizeof(why)) != 0) {
+				if (!unknown || !g_model.compat_needed) {
+					finish(UPDATE_FAILED, unknown ? "Cannot tell which player this package is for: %s." : "%s", why);
+					return -1;
+				}
+				LOG("update: %s; the compatibility record decides", why);
 			}
-			rootfs_seen = 1;
-		}
-		LOG("update: %s: %d chunks, %lld bytes, md5 ok, fits %s (%lld bytes)", img[i].name, count, csize, dev,
-			psize);
-	}
-	if (!rootfs_seen) {
-		finish(UPDATE_FAILED, "The package has no system image, so nothing says which player it is for.");
-		return -1;
-	}
-	if (compat_problem[0]) {
-		if (ignore_compat) {
-			LOG("update: compatibility check overridden by the user: %s", compat_problem);
-		} else {
-			pthread_mutex_lock(&lock);
-			status.compat_overridable = 1;
-			pthread_mutex_unlock(&lock);
-			finish(UPDATE_FAILED, "%s Its system image is a %s, so it can be installed anyway.", compat_problem,
-				   g_model.name);
-			return -1;
 		}
 	}
 	memcpy(checked_img, img, sizeof(img[0]) * (size_t)n);
@@ -446,24 +637,30 @@ static int verify_images(char *bad, size_t bad_size) {
 		set_phase(phase, 0);
 		unsigned es = part_erasesize(num);
 		long long psize = mtd_part_size(num);
-		int fd = num >= 0 ? mtd_open_ro(num) : -1;
+		// The partition through nanddump --bb=padbad (bad blocks given as 0xff
+		// in their place); only the good blocks count, in order.
+		int fd = num >= 0 ? mtd_open_ro(num) : -1; // which blocks are bad
+		mtd_dump_t *d = fd >= 0 ? mtd_dump_begin(num, psize) : NULL;
 		uint8_t *buf = malloc(es);
 		md5_ctx c;
 		md5_init(&c);
 		long long got = 0;
-		bool read_ok = fd >= 0 && buf;
+		bool read_ok = d && buf;
 		for (long long off = 0; read_ok && got < im->size && off < psize; off += es) {
+			if (mtd_dump_read(d, buf, es) != 0) {
+				read_ok = false;
+				break;
+			}
 			if (mtd_block_bad(fd, off) == 1) {
 				continue;
 			}
 			size_t want = (size_t)(im->size - got < es ? im->size - got : es);
-			if (pread(fd, buf, want, (off_t)off) != (ssize_t)want) {
-				read_ok = false;
-				break;
-			}
 			md5_update(&c, buf, want);
 			got += (long long)want;
 			set_percent((int)(got * 100 / im->size));
+		}
+		if (d) {
+			mtd_dump_end(d, NULL); // stopped early on purpose: its status does not count
 		}
 		if (fd >= 0) {
 			close(fd);
@@ -487,108 +684,54 @@ static int verify_images(char *bad, size_t bad_size) {
 	return rc;
 }
 
-#ifdef HOST_BUILD
-// Simulated: the phases and progress the stock writer reports, and the
-// images written into $SIM_DIR/mtdN the way nandwrite -p writes them (bad
-// blocks skipped, the rest of the partition left as it was), so the read
-// back after it is a real one. SIM_FAIL_WRITE=1 fails halfway through the
-// system; SIM_CORRUPT_WRITE=1 writes the system with one byte wrong.
-static int sim_write_image(const image_t *im) {
-	char dev[32];
-	int num = mtd_find(image_part(im), dev, sizeof(dev));
-	unsigned es = part_erasesize(num);
-	int fd = mtd_open_rw(num);
-	if (fd < 0) {
-		return -1;
-	}
-	char cmd[700];
-	snprintf(cmd, sizeof(cmd), "cat %s/%s.[0-9][0-9][0-9][0-9].*", checked_dir, im->name);
-	FILE *p = popen(cmd, "r");
-	uint8_t *buf = malloc(es);
-	long long off = 0, left = im->size;
-	int rc = (p && buf) ? 0 : -1;
-	while (rc == 0 && left > 0) {
-		if (mtd_block_bad(fd, off) == 1) {
-			off += es;
-			continue;
-		}
-		size_t n = fread(buf, 1, (size_t)(left < es ? left : es), p);
-		if (n == 0) {
-			rc = -1;
-			break;
-		}
-		if (off == 0x20000 * 3 && strcmp(im->type, "rootfs") == 0 && getenv("SIM_CORRUPT_WRITE")) {
-			buf[100] ^= 0x01;
-			LOG("sim: SIM_CORRUPT_WRITE: one byte of the system written wrong");
-		}
-		if (mtd_erase_block(fd, off, es) != 0 || pwrite(fd, buf, n, (off_t)off) != (ssize_t)n) {
-			rc = -1;
-		}
-		off += es;
-		left -= (long long)n;
-	}
-	if (p) {
-		pclose(p);
-	}
-	free(buf);
-	close(fd);
-	LOG("sim: %s written to %s", im->name, dev);
-	return rc;
-}
-
-static int write_package(void) {
-	const char *phases[] = {"Writing kernel", "Writing system"};
+// Writes the checked images, the kernel first, each into its partition:
+// "kernel" and the first "rootfs", the normal system's, whatever the boot
+// record says (the worker has set it to the recovery already). Every chunk
+// is read and checked again as it goes in (chunk_pass), so a card that reads
+// differently now than during the check stops the write at that chunk.
+// 0 when every image went in whole; nothing is read back here.
+static int write_package(char *why, size_t why_size) {
+	long long total = 0, base = 0;
 	for (int i = 0; i < n_checked; i++) {
-		if (sim_write_image(&checked_img[i]) != 0) {
-			return 1;
-		}
+		total += checked_img[i].size;
 	}
-	for (int ph = 0; ph < 2; ph++) {
-		pthread_mutex_lock(&lock);
-		status.system_touched = 1;
-		pthread_mutex_unlock(&lock);
-		set_phase(phases[ph], -1);
-		for (int pct = ph * 10; pct <= (ph ? 100 : 10); pct++) {
-			if (ph == 1 && pct == 55 && getenv("SIM_FAIL_WRITE")) {
-				LOG("sim: SIM_FAIL_WRITE set, failing");
-				return 1;
+	for (int pass = 0; pass < 2; pass++) { // the kernel, then the system
+		for (int i = 0; i < n_checked; i++) {
+			const image_t *im = &checked_img[i];
+			bool is_kernel = strcmp(im->type, "kernel") == 0;
+			if (is_kernel != (pass == 0)) {
+				continue;
 			}
-			set_percent(pct);
-			usleep(30 * 1000);
+			char dev[32];
+			int num = mtd_find(image_part(im), dev, sizeof(dev));
+			if (num < 0) {
+				snprintf(why, why_size, "There is no %s partition.", image_part(im));
+				return -1;
+			}
+			pthread_mutex_lock(&lock);
+			status.system_touched = 1; // from the erase on
+			pthread_mutex_unlock(&lock);
+			set_phase(is_kernel ? "Writing kernel" : "Writing system", (int)(base * 100 / total));
+			LOG("update: writing %s (%lld bytes) to %s", im->name, im->size, dev);
+			mtd_image_writer_t *w = mtd_image_begin(num, im->size, MTD_IMAGE_MARKBAD);
+			if (!w) {
+				snprintf(why, why_size, "%s cannot be erased or opened for writing.", dev);
+				return -1;
+			}
+			int rc = chunk_pass(checked_dir, im, w, base, total, why, why_size);
+			if (mtd_image_end(w) != 0 && rc == 0) {
+				snprintf(why, why_size, "nandwrite could not write %s to %s.", im->name, dev);
+				rc = -1;
+			}
+			if (rc != 0) {
+				return -1;
+			}
+			base += im->size;
+			LOG("update: %s written to %s", im->name, dev);
 		}
 	}
-	return bootflag_write(BOOT_NORMAL) == 0 ? 0 : 1; // the script's local_set_next_boot_device
+	return 0;
 }
-#else
-// Runs the stock writer, following its progress lines.
-static int write_package(void) {
-	FILE *p = popen("cd /tmp && /etc/ota_bin/local_ota_update.sh " UPT_MOUNT " 2>&1", "r");
-	if (!p) {
-		return -1;
-	}
-	char line[512];
-	while (fgets(line, sizeof(line), p)) {
-		line[strcspn(line, "\r\n")] = '\0';
-		LOG("ota| %s", line);
-		int pct;
-		if (strstr(line, "start update kernel")) {
-			pthread_mutex_lock(&lock);
-			status.system_touched = 1;
-			pthread_mutex_unlock(&lock);
-			set_phase("Writing kernel", -1);
-		} else if (strstr(line, "start update rootfs")) {
-			pthread_mutex_lock(&lock);
-			status.system_touched = 1;
-			pthread_mutex_unlock(&lock);
-			set_phase("Writing system", -1);
-		} else if (sscanf(line, "ota: data processed: %d%%", &pct) == 1) {
-			set_percent(pct);
-		}
-	}
-	int rc = pclose(p);
-	return (rc != -1 && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
-}
-#endif
 
 // The file picked on the card, empty for <stem>.upt.
 static char requested[512];
@@ -631,11 +774,12 @@ static void *worker(void *arg) {
 	}
 	upt_mounted = true;
 
-	if (check_package(dir, sizeof(dir), card) != 0) {
+	if (check_package(dir, sizeof(dir)) != 0) {
 		goto out;
 	}
 
-	// See update.h: the writer targets the kernel the record does not name.
+	// The record on the recovery from before the first erase: if the write is
+	// cut short, the player starts here again (update.h).
 	if (bootflag_read() != BOOT_RECOVERY) {
 		set_phase("Setting the boot record", -1);
 		if (bootflag_write(BOOT_RECOVERY) != 0) {
@@ -645,11 +789,12 @@ static void *worker(void *arg) {
 	}
 
 	set_phase("Writing", -1);
-	int rc = write_package();
-	if (rc != 0) {
+	char why[200] = "";
+	if (write_package(why, sizeof(why)) != 0) {
 		update_status_t s;
 		update_get(&s);
-		finish(UPDATE_FAILED, "Writing failed (%d).%s", rc,
+		LOG("update: writing failed: %s", why);
+		finish(UPDATE_FAILED, "Writing failed: %s%s", why,
 			   s.system_touched ? " The system is incomplete: the player will start in recovery until an "
 								  "update succeeds."
 								: " Nothing was written.");
@@ -673,21 +818,20 @@ static void *worker(void *arg) {
 		finish(UPDATE_FAILED, "The update was written, but the boot record could not be set back to the system.");
 		goto out;
 	}
-	finish(UPDATE_DONE, "The update is installed and checked: kernel and system read back as in the package.");
+	finish(UPDATE_DONE, "The update is installed and verified.");
 
 out:
-	cleanup(card);
+	cleanup();
 	return NULL;
 }
 
-int update_start(const char *path, bool override_compat) {
+int update_start(const char *path) {
 	pthread_mutex_lock(&lock);
 	if (status.state == UPDATE_RUNNING) {
 		pthread_mutex_unlock(&lock);
 		return -1;
 	}
 	snprintf(requested, sizeof(requested), "%s", path ? path : "");
-	ignore_compat = override_compat;
 	memset(&status, 0, sizeof(status));
 	status.state = UPDATE_RUNNING;
 	status.percent = -1;

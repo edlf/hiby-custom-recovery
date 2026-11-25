@@ -56,7 +56,7 @@ static void mark_wrote(void) {
 	pthread_mutex_unlock(&lock);
 }
 
-// "HiBy R1" out of info.txt's first line, "HiBy R1, Sonix Recovery ...".
+// "HiBy R1" out of info.txt's first line, "HiBy R1, Zee's Recovery ...".
 static void read_model(const char *dir, char *out, size_t size) {
 	char path[600];
 	snprintf(path, sizeof(path), "%s/info.txt", dir);
@@ -89,7 +89,7 @@ int restore_list_backups(backup_entry_t *out, int max) {
 	int n = 0;
 	struct dirent *e;
 	while (n < max && (e = readdir(d))) {
-		if (strncmp(e->d_name, "sonix-backup-", 13) != 0) {
+		if (strncmp(e->d_name, "zees-backup-", 12) != 0) {
 			continue;
 		}
 		backup_entry_t *b = &out[n];
@@ -237,75 +237,113 @@ static bool mtd_txt_matches(const char *dir) {
 	return ok && i == nc;
 }
 
-// Writes `file` onto mtd<num> block by block, then reads it back. 0, or -1
-// with the reason logged. With `want` the data comes from there instead
-// (the bootloader's old contents).
+// Writes `file` onto mtd<num> with the mtd-utils, then reads it back with
+// them (device.h): flash_erase, then nandwrite -k fed the backup without the
+// blocks that are bad on the flash now. Those hold only 0xff in the backup
+// (check_bad_blocks), and nandwrite skips them, so every other block lands at
+// the offset it was read from. No -m: a block that fails to write would push
+// the rest one block on, so the write fails instead (and is tried once more
+// by the worker). Then nanddump --bb=padbad, compared block by block with the
+// backup, the bad blocks left out. 0, or -1 with the reason logged. With
+// `want` the data comes from there instead (the bootloader's old contents).
 static int write_part(const restore_part_t *p, unsigned es, const char *file, const uint8_t *want, long long done,
 					  long long total) {
 	int in = want ? -1 : open(file, O_RDONLY);
-	int fd = mtd_open_rw(p->num);
+	int ro = mtd_open_ro(p->num); // for which blocks are bad (an ioctl, no data read)
 	uint8_t *src = malloc(es), *back = malloc(es);
+	mtd_image_writer_t *w = NULL;
+	mtd_dump_t *d = NULL;
 	int rc = 0;
-	if ((!want && in < 0) || fd < 0 || !src || !back) {
+	if ((!want && in < 0) || ro < 0 || !src || !back) {
 		LOG("restore: mtd%d: cannot open", p->num);
 		rc = -1;
 		goto out;
 	}
-	unsigned ws = mtd_writesize(fd);
-	if (ws == 0 || es % ws != 0) {
-		ws = es;
+	long long good = 0;
+	int nbad = 0;
+	for (long long off = 0; off < p->size; off += es) {
+		if (mtd_block_bad(ro, off) == 1) {
+			nbad++;
+		} else {
+			good += es;
+		}
 	}
-	for (int pass = 0; pass < 2 && rc == 0; pass++) { // 0 write, 1 read back
-		for (long long off = 0; off < p->size; off += es) {
-			if (want) {
-				memcpy(src, want + off, es);
-			} else if (pread(in, src, es, (off_t)off) != (ssize_t)es) {
-				LOG("restore: mtd%d: the file cannot be read at 0x%llx", p->num, off);
-				rc = -1;
-				break;
-			}
-			if (mtd_block_bad(fd, off) == 1) {
-				continue; // checked before: the backup has nothing there
-			}
-			if (pass == 0) {
-				if (mtd_erase_block(fd, off, es) != 0) {
-					LOG("restore: mtd%d: erase at 0x%llx failed", p->num, off);
-					rc = -1;
-					break;
-				}
-				for (unsigned pg = 0; pg < es; pg += ws) {
-					if (all_ff(src + pg, ws)) {
-						continue;
-					}
-					if (pwrite(fd, src + pg, ws, (off_t)(off + pg)) != (ssize_t)ws) {
-						LOG("restore: mtd%d: write at 0x%llx failed", p->num, off + pg);
-						rc = -1;
-						break;
-					}
-				}
-				set_phase((int)((done + off + es) * 100 / total), "Writing mtd%d %s: %lld of %lld MB", p->num,
-						  p->name, (off + es) >> 20, p->size >> 20);
-			} else {
-				if (pread(fd, back, es, (off_t)off) != (ssize_t)es || memcmp(back, src, es) != 0) {
-					LOG("restore: mtd%d: read back differs at 0x%llx", p->num, off);
-					rc = -1;
-					break;
-				}
-			}
-			if (rc) {
-				break;
-			}
+	if (nbad) {
+		LOG("restore: mtd%d: %d bad blocks, skipped (the backup has only 0xff there)", p->num, nbad);
+	}
+
+	w = mtd_image_begin(p->num, good, MTD_IMAGE_SKIP_FF);
+	if (!w) {
+		LOG("restore: mtd%d: flash_erase or nandwrite cannot be started", p->num);
+		rc = -1;
+		goto out;
+	}
+	for (long long off = 0; off < p->size && rc == 0; off += es) {
+		if (mtd_block_bad(ro, off) == 1) {
+			continue;
 		}
-		if (pass == 0 && rc == 0) {
-			set_phase((int)((done + p->size) * 100 / total), "Checking mtd%d %s", p->num, p->name);
+		if (want) {
+			memcpy(src, want + off, es);
+		} else if (pread(in, src, es, (off_t)off) != (ssize_t)es) {
+			LOG("restore: mtd%d: the file cannot be read at 0x%llx", p->num, off);
+			rc = -1;
+			break;
 		}
+		if (mtd_image_write(w, src, es) != 0) {
+			LOG("restore: mtd%d: nandwrite stopped taking data at 0x%llx", p->num, off);
+			rc = -1;
+			break;
+		}
+		set_phase((int)((done + off + es) * 100 / total), "Writing mtd%d %s: %lld of %lld MB", p->num, p->name,
+				  (off + es) >> 20, p->size >> 20);
+	}
+	if (mtd_image_end(w) != 0 && rc == 0) {
+		LOG("restore: mtd%d: nandwrite failed", p->num);
+		rc = -1;
+	}
+	w = NULL;
+	if (rc != 0) {
+		goto out;
+	}
+
+	set_phase((int)((done + p->size) * 100 / total), "Checking mtd%d %s", p->num, p->name);
+	d = mtd_dump_begin(p->num, p->size);
+	if (!d) {
+		LOG("restore: mtd%d: nanddump cannot be started", p->num);
+		rc = -1;
+		goto out;
+	}
+	for (long long off = 0; off < p->size; off += es) {
+		if (mtd_dump_read(d, back, es) != 0) {
+			LOG("restore: mtd%d: cannot be read back at 0x%llx", p->num, off);
+			rc = -1;
+			break;
+		}
+		if (mtd_block_bad(ro, off) == 1) {
+			continue; // given as 0xff, and not written
+		}
+		if (want) {
+			memcpy(src, want + off, es);
+		} else if (pread(in, src, es, (off_t)off) != (ssize_t)es) {
+			rc = -1;
+			break;
+		}
+		if (memcmp(back, src, es) != 0) {
+			LOG("restore: mtd%d: read back differs at 0x%llx", p->num, off);
+			rc = -1;
+			break;
+		}
+	}
+	if (mtd_dump_end(d, NULL) != 0 && rc == 0) {
+		LOG("restore: mtd%d: nanddump failed", p->num);
+		rc = -1;
 	}
 out:
 	if (in >= 0) {
 		close(in);
 	}
-	if (fd >= 0) {
-		close(fd);
+	if (ro >= 0) {
+		close(ro);
 	}
 	free(src);
 	free(back);

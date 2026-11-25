@@ -18,6 +18,7 @@
 #include "log.h"
 #include "storage.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -130,21 +131,11 @@ int device_factory_reset(bool keep_media_db) {
 			   p, p);
 }
 
+void device_leds_purple(void) { LOG("sim: leds red and blue breathing (purple)"); }
+
 int device_start_adb(void) {
 	LOG("sim: /etc/init.d/T90adb start");
 	return 0;
-}
-
-int squashfs_read_file(const char *image, const char *path, char *out, size_t size) {
-	char q[600], cmd[800];
-	snprintf(cmd, sizeof(cmd), "unsquashfs -cat %s %s 2>/dev/null", shq(image, q, sizeof(q)), path);
-	FILE *p = popen(cmd, "r");
-	if (!p) {
-		return -1;
-	}
-	int n = (int)fread(out, 1, size - 1, p);
-	out[n] = '\0';
-	return pclose(p) == 0 ? n : -1;
 }
 
 // The uboot partition: $SIM_DIR/mtd0, 512 KiB. Created as a stand-in for
@@ -281,37 +272,7 @@ int mtd_block_bad(int fd, long long off) {
 	return (b && atoi(b) == sim_open_num && off == 0x20000) ? 1 : 0;
 }
 
-long long mtd_ecc_failed(int fd) {
-	(void)fd;
-	static int reads[16];
-	const char *e = getenv("SIM_MTD_ECC");
-	// first call per partition: 0; the next ones: 1 for the chosen one
-	int n = sim_open_num;
-	return (e && atoi(e) == n && n >= 0 && n < 16 && reads[n]++ > 0) ? 1 : 0;
-}
-
-// SIM_THEME="theme:1,a3,c0" (light, green) or $SIM_DIR/theme; dark and
-// blue without either.
-void theme_marker_read(char *out, size_t size) {
-	const char *t = getenv("SIM_THEME");
-	out[0] = '\0';
-	if (t) {
-		snprintf(out, size, "%s", t);
-		return;
-	}
-	char p[512];
-	sim_path(p, sizeof(p), "theme");
-	FILE *f = fopen(p, "r");
-	if (f) {
-		if (!fgets(out, (int)size, f)) {
-			out[0] = '\0';
-		}
-		out[strcspn(out, "\r\n")] = '\0';
-		fclose(f);
-	}
-}
-
-int mtd_open_rw(int num) {
+static int sim_open_rw(int num) {
 	int fd = mtd_open_ro(num); // makes the file when missing
 	if (fd < 0) {
 		return -1;
@@ -333,15 +294,201 @@ int mtd_open_rw(int num) {
 	return open(p, O_RDWR);
 }
 
-int mtd_erase_block(int fd, long long off, unsigned size) {
+static int sim_erase_block(int fd, long long off, unsigned size) {
 	static uint8_t ff[0x20000];
 	memset(ff, 0xff, sizeof(ff));
 	return (size <= sizeof(ff) && pwrite(fd, ff, size, (off_t)off) == (ssize_t)size) ? 0 : -1;
 }
 
-unsigned mtd_writesize(int fd) {
-	(void)fd;
-	return 2048;
+// Images: as nandwrite -p lays them out. begin erases every good block, the
+// data goes block by block into the good ones in order, and the last block
+// is padded with 0xff (-k makes no difference here: an erased page is 0xff).
+// SIM_FAIL_WRITE=1 makes the write into the first "rootfs" fail halfway;
+// SIM_CORRUPT_WRITE=1 writes one byte of it wrong (block 3), for the read
+// back to catch.
+struct mtd_image_writer {
+	int fd, num;
+	long long off, size, sent;
+	uint8_t blk[0x20000];
+	size_t fill;
+	bool rootfs, failed;
+};
+
+static int sim_image_flush(mtd_image_writer_t *w) {
+	if (w->fill == 0) {
+		return 0;
+	}
+	memset(w->blk + w->fill, 0xff, sizeof(w->blk) - w->fill);
+	while (w->off < PARTS[w->num].size && mtd_block_bad(w->fd, w->off) == 1) {
+		w->off += sizeof(w->blk); // nandwrite skips it
+	}
+	if (w->off >= PARTS[w->num].size) {
+		LOG("sim: image does not fit mtd%d", w->num);
+		return -1;
+	}
+	if (w->rootfs && w->off == 3 * (long long)sizeof(w->blk) && getenv("SIM_CORRUPT_WRITE")) {
+		w->blk[100] ^= 0x01;
+		LOG("sim: SIM_CORRUPT_WRITE: one byte of the system written wrong");
+	}
+	if (pwrite(w->fd, w->blk, sizeof(w->blk), (off_t)w->off) != (ssize_t)sizeof(w->blk)) {
+		return -1;
+	}
+	w->off += sizeof(w->blk);
+	w->fill = 0;
+	return 0;
+}
+
+mtd_image_writer_t *mtd_image_begin(int num, long long size, unsigned flags) {
+	if (num < 0 || num >= N_PARTS) {
+		return NULL;
+	}
+	mtd_image_writer_t *w = calloc(1, sizeof(*w));
+	if (!w) {
+		return NULL;
+	}
+	w->fd = sim_open_rw(num);
+	if (w->fd < 0) {
+		free(w);
+		return NULL;
+	}
+	w->num = num;
+	w->size = size;
+	char dev[32];
+	w->rootfs = mtd_find("rootfs", dev, sizeof(dev)) == num;
+	for (long long off = 0; off < PARTS[num].size; off += sizeof(w->blk)) {
+		if (mtd_block_bad(w->fd, off) != 1 && sim_erase_block(w->fd, off, sizeof(w->blk)) != 0) {
+			close(w->fd);
+			free(w);
+			return NULL;
+		}
+	}
+	LOG("sim: flash_erase mtd%d; nandwrite%s%s -p --input-size=%lld", num, (flags & MTD_IMAGE_MARKBAD) ? " -m" : "",
+		(flags & MTD_IMAGE_SKIP_FF) ? " -k" : "", size);
+	return w;
+}
+
+int mtd_image_write(mtd_image_writer_t *w, const void *buf, size_t len) {
+	const uint8_t *p = buf;
+	while (len > 0 && !w->failed) {
+		if (w->rootfs && getenv("SIM_FAIL_WRITE") && w->sent >= w->size / 2) {
+			LOG("sim: SIM_FAIL_WRITE: nandwrite fails halfway through the system");
+			w->failed = true;
+			break;
+		}
+		size_t n = sizeof(w->blk) - w->fill;
+		n = n < len ? n : len;
+		memcpy(w->blk + w->fill, p, n);
+		w->fill += n;
+		w->sent += (long long)n;
+		p += n;
+		len -= n;
+		if (w->fill == sizeof(w->blk) && sim_image_flush(w) != 0) {
+			w->failed = true;
+		}
+	}
+	return w->failed ? -1 : 0;
+}
+
+int mtd_image_end(mtd_image_writer_t *w) {
+	if (!w) {
+		return -1;
+	}
+	int rc = (!w->failed && w->sent == w->size && sim_image_flush(w) == 0) ? 0 : -1;
+	close(w->fd);
+	LOG("sim: nandwrite mtd%d: %lld of %lld bytes, %s", w->num, w->sent, w->size, rc ? "failed" : "ok");
+	free(w);
+	return rc;
+}
+
+// Reading: as nanddump --bb=padbad gives it. A block SIM_MTD_BAD marks is
+// given as 0xff and counted; SIM_MTD_ECC=N reports one uncorrectable ECC
+// error in mtdN (its data given as it is).
+struct mtd_dump {
+	int fd, num;
+	long long off, length, end;
+	uint8_t blk[0x20000];
+	size_t have, pos;
+	mtd_dump_stats_t st;
+	bool failed;
+};
+
+mtd_dump_t *mtd_dump_begin(int num, long long length) { return mtd_dump_begin_at(num, 0, length); }
+
+// SIM_MTD_EIO=N: erase block 2 of mtdN cannot be read at all (nanddump stops).
+mtd_dump_t *mtd_dump_begin_at(int num, long long start, long long length) {
+	if (num < 0 || num >= N_PARTS || start < 0 || start >= PARTS[num].size) {
+		return NULL;
+	}
+	mtd_dump_t *d = calloc(1, sizeof(*d));
+	if (!d) {
+		return NULL;
+	}
+	d->fd = mtd_open_ro(num);
+	if (d->fd < 0) {
+		free(d);
+		return NULL;
+	}
+	d->num = num;
+	d->off = start;
+	d->length = length > 0 && start + length < PARTS[num].size ? length : PARTS[num].size - start;
+	d->end = start + d->length;
+	const char *e = getenv("SIM_MTD_ECC");
+	if (e && atoi(e) == num) {
+		d->st.ecc_failed = 1;
+		LOG("sim: nanddump mtd%d: ECC: 1 uncorrectable bitflip(s) at offset 0x00040000", num);
+	}
+	LOG("sim: nanddump -a --bb=padbad -s %lld -l %lld mtd%d", start, d->length, num);
+	return d;
+}
+
+int mtd_dump_read(mtd_dump_t *d, void *buf, size_t len) {
+	uint8_t *out = buf;
+	while (len > 0 && !d->failed) {
+		if (d->pos == d->have) {
+			if (d->off >= d->end) {
+				d->failed = true;
+				break;
+			}
+			const char *eio = getenv("SIM_MTD_EIO");
+			if (eio && atoi(eio) == d->num && d->off == 0x40000) {
+				LOG("sim: nanddump mtd%d: pread at 0x40000: Input/output error", d->num);
+				d->failed = true;
+				break;
+			}
+			long long left = d->end - d->off;
+			size_t want = (size_t)(left < (long long)sizeof(d->blk) ? left : (long long)sizeof(d->blk));
+			if (mtd_block_bad(d->fd, d->off) == 1) {
+				memset(d->blk, 0xff, want);
+				d->st.bad_blocks++;
+				LOG("sim: nanddump mtd%d: Bad block at %llx (given as 0xff)", d->num, d->off);
+			} else if (pread(d->fd, d->blk, want, (off_t)d->off) != (ssize_t)want) {
+				d->failed = true;
+				break;
+			}
+			d->off += (long long)want;
+			d->have = want;
+			d->pos = 0;
+		}
+		size_t n = d->have - d->pos < len ? d->have - d->pos : len;
+		memcpy(out, d->blk + d->pos, n);
+		d->pos += n;
+		out += n;
+		len -= n;
+	}
+	return d->failed ? -1 : 0;
+}
+
+int mtd_dump_end(mtd_dump_t *d, mtd_dump_stats_t *st) {
+	if (!d) {
+		return -1;
+	}
+	int rc = d->failed ? -1 : 0;
+	if (st) {
+		*st = d->st;
+	}
+	close(d->fd);
+	free(d);
+	return rc;
 }
 
 int userdata_release(int num) {
@@ -358,6 +505,29 @@ bool storage_card_present(void) {
 	return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+// SIM_CARD_SIZE=bytes, default a 32 GB card's 31914983424.
+long long storage_card_size(void) {
+	if (!storage_card_present()) {
+		return -1;
+	}
+	const char *e = getenv("SIM_CARD_SIZE");
+	return e && e[0] ? atoll(e) : 31914983424LL;
+}
+
+// Read-only as on the player: the card folder (not what is in it) loses its
+// write bit, so making a file or folder in its top fails as a read-only mount
+// would. Writes deeper down are not caught.
+static int sim_card_mode(bool rw) {
+	char p[512];
+	sim_path(p, sizeof(p), "sd");
+	if (chmod(p, rw ? 0755 : 0555) != 0) {
+		LOG("sim: chmod %s: %s", p, strerror(errno));
+		return -1;
+	}
+	LOG("sim: card %s", rw ? "writable" : "read-only");
+	return 0;
+}
+
 int storage_mount(int timeout_s, char *mnt, size_t mnt_size) {
 	(void)timeout_s;
 	if (!storage_card_present()) {
@@ -365,7 +535,14 @@ int storage_mount(int timeout_s, char *mnt, size_t mnt_size) {
 		return -1;
 	}
 	sim_path(mnt, mnt_size, "sd");
+	sim_card_mode(false);
 	return 0;
 }
 
-void storage_unmount(void) {}
+int storage_set_writable(bool rw) { return storage_card_present() ? sim_card_mode(rw) : -1; }
+
+void storage_unmount(void) {
+	if (storage_card_present()) {
+		sim_card_mode(false);
+	}
+}

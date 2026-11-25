@@ -75,13 +75,13 @@ static int make_folder(const char *card, char *out, size_t size) {
 	if (localtime_r(&now, &tm) && tm.tm_year + 1900 >= 2024) {
 		char stamp[32];
 		strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
-		snprintf(out, size, "%s/sonix-backup-%s", card, stamp);
+		snprintf(out, size, "%s/zees-backup-%s", card, stamp);
 		if (mkdir(out, 0755) == 0) {
 			return 0;
 		}
 	}
 	for (int i = 1; i < 1000; i++) {
-		snprintf(out, size, "%s/sonix-backup-%d", card, i);
+		snprintf(out, size, "%s/zees-backup-%d", card, i);
 		if (mkdir(out, 0755) == 0) {
 			return 0;
 		}
@@ -116,56 +116,51 @@ static int file_md5(const char *path, char out[33]) {
 typedef struct {
 	int bad_blocks;
 	long long ecc_failed;
-	int read_errors;
+	int read_errors; // blocks nanddump could not read at all, written as 0xff
 	char md5[33];
 } part_result_t;
 
-// One partition into `path`. done/total: bytes for the overall percentage.
+// One partition into `path`, read with nanddump --bb=padbad (device.h): bad
+// blocks given as 0xff in their place, uncorrectable ECC errors counted with
+// the data kept. A block nanddump cannot read at all (it stops there) is
+// written as 0xff and counted as a read error, and a new nanddump goes on from
+// the next block. done/total: bytes for the overall percentage. 0 on success,
+// -1 when the flash cannot be read, -2 when the card cannot be written.
 static int copy_part(const mtd_part_t *p, const char *path, long long done, long long total, part_result_t *r) {
 	memset(r, 0, sizeof(*r));
-	int fd = mtd_open_ro(p->num);
-	if (fd < 0) {
-		return -1;
-	}
 	FILE *out = fopen(path, "wb");
 	if (!out) {
-		close(fd);
 		return -2;
 	}
 	unsigned es = p->erasesize ? p->erasesize : 0x20000;
 	uint8_t *buf = malloc(es);
-	if (!buf) {
+	mtd_dump_t *d = buf ? mtd_dump_begin(p->num, p->size) : NULL;
+	if (!d) {
+		free(buf);
 		fclose(out);
-		close(fd);
 		return -1;
 	}
-	long long ecc0 = mtd_ecc_failed(fd);
 	md5_ctx c;
 	md5_init(&c);
 	int rc = 0;
+	mtd_dump_stats_t st;
 	for (long long off = 0; off < p->size; off += es) {
 		size_t want = (size_t)((p->size - off) < es ? (p->size - off) : es);
-		if (mtd_block_bad(fd, off) == 1) {
+		if (mtd_dump_read(d, buf, want) != 0) {
+			// nanddump stopped in this block: what it gave of it is not kept
+			mtd_dump_end(d, &st);
+			r->bad_blocks += st.bad_blocks;
+			r->ecc_failed += st.ecc_failed;
 			memset(buf, 0xff, want);
-			r->bad_blocks++;
-			LOG("backup: mtd%d: bad block at 0x%llx, written as 0xff", p->num, off);
-		} else {
-			if (lseek(fd, (off_t)off, SEEK_SET) != (off_t)off) {
-				rc = -1;
-				break;
-			}
-			size_t got = 0;
-			while (got < want) {
-				ssize_t n = read(fd, buf + got, want - got);
-				if (n <= 0) {
+			r->read_errors++;
+			LOG("backup: mtd%d: block at 0x%llx cannot be read, written as 0xff", p->num, off);
+			d = NULL;
+			if (off + (long long)want < p->size) {
+				d = mtd_dump_begin_at(p->num, off + (long long)want, p->size - off - (long long)want);
+				if (!d) {
+					rc = -1;
 					break;
 				}
-				got += (size_t)n;
-			}
-			if (got < want) {
-				memset(buf + got, 0xff, want - got);
-				r->read_errors++;
-				LOG("backup: mtd%d: read error at 0x%llx, rest of the block written as 0xff", p->num, off + got);
 			}
 		}
 		md5_update(&c, buf, want);
@@ -176,12 +171,19 @@ static int copy_part(const mtd_part_t *p, const char *path, long long done, long
 		int pct = (int)((done + off + (long long)want) * 100 / total);
 		set_phase(pct, "mtd%d %s: %lld of %lld MB", p->num, p->name, (off + (long long)want) >> 20, p->size >> 20);
 	}
-	long long ecc1 = mtd_ecc_failed(fd);
-	if (ecc0 >= 0 && ecc1 > ecc0) {
-		r->ecc_failed = ecc1 - ecc0;
+	if (d) {
+		if (mtd_dump_end(d, &st) != 0 && rc == 0) {
+			rc = -1;
+		}
+		r->bad_blocks += st.bad_blocks;
+		r->ecc_failed += st.ecc_failed;
+	}
+	if (r->bad_blocks || r->ecc_failed || r->read_errors) {
+		LOG("backup: mtd%d: %d bad blocks (written as 0xff), %lld uncorrectable ECC errors (data kept), %d "
+			"unreadable blocks (written as 0xff)",
+			p->num, r->bad_blocks, r->ecc_failed, r->read_errors);
 	}
 	free(buf);
-	close(fd);
 	if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
 		rc = rc ? rc : -2;
 	}
@@ -205,6 +207,11 @@ static void *worker(void *arg) {
 		goto out;
 	}
 	card_mounted = true;
+	// The one time the card is written (storage.h); read-only again at the end.
+	if (storage_set_writable(true) != 0) {
+		finish(BACKUP_FAILED, "The card cannot be made writable (write-protected or damaged?).");
+		goto out;
+	}
 	int n = mtd_list(parts, MAX_PARTS);
 	if (n <= 0) {
 		finish(BACKUP_FAILED, "The partition table (/proc/mtd) cannot be read.");
@@ -249,7 +256,7 @@ static void *worker(void *arg) {
 		finish(BACKUP_FAILED, "Cannot write to the card.");
 		goto out;
 	}
-	fprintf(info, "%s, Sonix Recovery %s\n\n", g_model.name, SONIX_RECOVERY_VERSION);
+	fprintf(info, "%s, Zee's Recovery %s\n\n", g_model.name, ZEES_RECOVERY_VERSION);
 
 	long long done = 0;
 	int copied = 0, flagged = 0;
@@ -315,8 +322,9 @@ out:
 	}
 	if (card_mounted) {
 		char dst[400], q[500];
-		snprintf(dst, sizeof(dst), "%s/sonix_recovery.log", card);
+		snprintf(dst, sizeof(dst), "%s/zees_recovery.log", card);
 		run("cp %s %s", LOG_FILE, shq(dst, q, sizeof(q)));
+		storage_set_writable(false);
 		storage_unmount();
 	}
 	return NULL;

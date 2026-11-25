@@ -14,19 +14,23 @@
 //   ota_vN/<img>.NNNN.<md5>             the image in 512 KiB chunks
 //   ota_vN/ota_md5_<img>.<md5 of chunk 0>  one md5 per chunk
 //
-// Before anything is erased the whole package is checked here: the model's
-// file name, the compatibility record, that each image fits its partition and
-// that the chunks join up to the size and md5 ota_update.in gives. The writing
-// itself is left to the stock /etc/ota_bin/local_ota_update.sh, which is what
-// the stock recovery runs too.
+// Before anything is erased the whole package is checked here: the
+// compatibility record and the system image's /usr/resource/hostname (read
+// in place, squashfs.h) for which player it is for, that the kernel is a
+// uImage the bootloader can start, that ota_update.in names this version, that each image is a kernel or a
+// rootfs (once each) and fits its partition, and every chunk against its md5
+// in ota_md5_<img>.<img_md5>, with the md5 of them all against img_md5. The
+// card stays read-only throughout (storage.h).
 //
-// That script writes to whichever kernel the boot record does NOT name: run
-// with "ota:kernel2" it writes kernel/rootfs, the normal system. Entered with
-// Volume up the record still says "ota:kernel", and the script would aim at
-// this recovery's own partitions -- so the record is set to "ota:kernel2"
-// first. The script puts "ota:kernel" back when it succeeds; when it fails
-// the record stays on the recovery, and the player comes back here until an
-// update succeeds.
+// Then it writes, as HiBy's updater did but without its scripts: the boot
+// record set to "ota:kernel2" first, so a write cut short starts the
+// recovery again; then the kernel into "kernel" and the system into the
+// first "rootfs" (never kernel2/rootfs2, which this recovery runs from),
+// each with flash_erase and nandwrite -m -p (device.h), the chunks checked
+// again on their way in. Then each image is read back from flash the way the
+// boot reads it and compared with img_md5; only when both match does the
+// record go back to "ota:kernel". A failure leaves it on the recovery, and
+// the player comes back here until an update succeeds.
 
 typedef enum {
 	UPDATE_IDLE = 0,
@@ -41,24 +45,12 @@ typedef struct {
 	int percent;	   // of the current phase, -1 when unknown
 	char message[256]; // the outcome, when DONE or FAILED
 	int system_touched; // the normal system's flash was erased at some point
-	int compat_overridable; // FAILED only on the compatibility record: the
-							// system image is this player's (update_start(.., true))
 } update_status_t;
 
 // Starts the worker on `path`, or on the card's <stem>.upt when NULL. -1
-// when one is already running.
-//
-// Any .upt can be picked, whatever its name: the model is checked inside the
-// package, from its system image (rootfs.squashfs). The chunks are joined
-// into a temporary file on the card in the same pass as the md5, that file is
-// loop-mounted read-only and its /usr/resource/hostname must name this
-// player ("HiBy R1"); the R1's compatibility record is checked as before. A
-// package with no system image is refused.
-//
-// override_compat: the compatibility record (ota_compatibility.in) may be
-// wrong or missing. The user's choice, offered when a run fails with
-// compat_overridable; the system image check still applies.
-int update_start(const char *path, bool override_compat);
+// when one is already running. Any .upt can be picked, whatever its name:
+// the compatibility record decides (model.h).
+int update_start(const char *path);
 
 // One folder of the card for the file browser: its sub-folders and .upt
 // files (nothing else; hidden ones and the system's skipped), folders first,

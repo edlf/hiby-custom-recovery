@@ -13,13 +13,14 @@
 //   compat        prefix that ota_v<N>/ota_compatibility.in must start with
 //                 ("compatibility=hiby_r1_x1600_auto_rf_auto"). The R3 Pro II
 //                 images carry no such file, so for it an absent file is
-//                 accepted; a present one must still match.
+//                 accepted; a present one must still match. The record is the
+//                 only check of which player a package is for.
 //   compat_needed whether the file must be there
 //   rootfs_hostname  what /usr/resource/hostname holds in this model's
 //                 system image, stock and Sonix alike ("HiBy R1",
-//                 "HiBy R3PROII"). The check that a package is for this
-//                 player whatever its file name: see update.c.
-//   uboot_image   the Sonix bootloader's file name in the recovery root fs
+//                 "HiBy R3PROII"): which player a package is for, whatever
+//                 its compatibility record says (update.c).
+//   uboot_image   Zee's bootloader's file name in the recovery root fs
 //                 (bootloader.h), the base image without a partition table
 //   uboot_installable  whether the recovery offers to install it. Not on the
 //                 R3 Pro II: its board has not been compared with its stock

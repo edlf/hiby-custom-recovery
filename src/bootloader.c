@@ -17,15 +17,15 @@
 #define SIGNATURE "ota:fastboot"
 #define PART_TABLE_OFF 0x5800
 #define PART_TABLE_LEN 0x400
-#define TMP_IMAGE "/tmp/sonix-uboot.bin"
-#define TMP_ORIG "/tmp/sonix-uboot-orig.bin"
+#define TMP_IMAGE "/tmp/zees-uboot.bin"
+#define TMP_ORIG "/tmp/zees-uboot-orig.bin"
 
-// The boot ROM's header at the start of every SPL, stock and Sonix alike.
+// The boot ROM's header at the start of every SPL, stock and Zee's alike.
 static const uint8_t SPL_MAGIC[8] = {0x06, 0x05, 0x04, 0x03, 0x02, 0x55, 0xaa, 0x55};
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static bl_status_t status;
-static int sonix_cached = -1;
+static int zees_cached = -1;
 
 // The partition as it was before this process first wrote to it. A retry
 // after a write that went wrong must not take the broken flash for the
@@ -88,15 +88,15 @@ static bool contains(const uint8_t *buf, size_t len, const char *s) {
 	return false;
 }
 
-bool bootloader_is_sonix(void) {
-	if (sonix_cached < 0) {
+bool bootloader_is_zees(void) {
+	if (zees_cached < 0) {
 		long long size;
 		uint8_t *buf = read_part(&size);
-		sonix_cached = buf && contains(buf, (size_t)size, SIGNATURE);
-		LOG("bootloader: %s", !buf ? "cannot read the uboot partition" : sonix_cached ? "Sonix (fastboot)" : "stock");
+		zees_cached = buf && contains(buf, (size_t)size, SIGNATURE);
+		LOG("bootloader: %s", !buf ? "cannot read the uboot partition" : zees_cached ? "Zee's (fastboot)" : "stock");
 		free(buf);
 	}
-	return sonix_cached == 1;
+	return zees_cached == 1;
 }
 
 static void image_path(char *out, size_t size, const char *suffix) {
@@ -177,6 +177,13 @@ static void backup_to_card(const uint8_t *orig, size_t len) {
 		LOG("bootloader: no card, no backup copy");
 		return;
 	}
+	// A backup, so the card is writable for it (storage.h), and read-only again
+	// right after.
+	if (storage_set_writable(true) != 0) {
+		LOG("bootloader: the card cannot be made writable, no backup copy");
+		storage_unmount();
+		return;
+	}
 	char path[512];
 	for (int i = 1; i < 100; i++) {
 		snprintf(path, sizeof(path), "%s/uboot-backup-%d.bin", card, i);
@@ -188,6 +195,7 @@ static void backup_to_card(const uint8_t *orig, size_t len) {
 			break;
 		}
 	}
+	storage_set_writable(false);
 	storage_unmount();
 }
 
@@ -272,10 +280,10 @@ static void *worker(void *arg) {
 	phase("Writing the bootloader");
 	for (int attempt = 1; attempt <= 2; attempt++) {
 		if (write_and_verify(TMP_IMAGE, img, img_len, psize) == 0) {
-			sonix_cached = -1;
+			zees_cached = -1;
 			free(first_orig);
 			first_orig = NULL;
-			finish(BL_DONE, "The Sonix bootloader is installed. Fastboot: hold Play/Pause at power-on, or use "
+			finish(BL_DONE, "Zee's bootloader is installed. Fastboot: hold Play/Pause at power-on, or use "
 							"\"Reboot to fastboot\".");
 			goto out;
 		}
@@ -286,7 +294,7 @@ static void *worker(void *arg) {
 	phase("Putting the old bootloader back");
 	for (int attempt = 1; attempt <= 2; attempt++) {
 		if (write_and_verify(TMP_ORIG, orig, (size_t)psize, psize) == 0) {
-			sonix_cached = -1;
+			zees_cached = -1;
 			free(first_orig);
 			first_orig = NULL;
 			finish(BL_FAILED, "The new bootloader could not be written correctly; the old one was put back and "

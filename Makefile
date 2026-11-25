@@ -1,32 +1,64 @@
-# Sonix Recovery.
+# Zee's Recovery.
 #
-#   make                 MODEL=r1 (default)  -> build/r1/sonix_recovery
-#   make MODEL=r3proii                       -> build/r3proii/sonix_recovery
-#   make host [MODEL=..]                     -> build/host-<model>/sonix_recovery_sim
+#   make                 MODEL=r1 (default)  -> build/r1/zees_recovery
+#   make MODEL=r3proii                       -> build/r3proii/zees_recovery
+#   make host [MODEL=..]                     -> build/host-<model>/zees_recovery_sim
 #                                               (the PC simulator, see src/sim_platform.c)
 #   make shots                               host build, then screenshots of every
 #                                               screen into build/shots-<model>/
-#   make clean
+#   make toolchain                           only the cross toolchain (deps/)
+#   make clean                               build/; make distclean also deps/
 #
-# The cross toolchain and LVGL are the player's: ../sonix-player/sonix-player
-# has rockbox-toolchain/ and lvgl/ (the player's own Makefile clones LVGL on
-# its first run, so run `make target` there once first; the folder has to be
-# called lvgl, sources include "lvgl/lvgl.h"). LVGL is built once
-# into build/lvgl/ and shared by both models.
+# Everything it builds with is fetched or built here, under deps/ (not in
+# git), on first use:
+#   deps/rockbox-toolchain/  the cross toolchain (GCC 9, glibc 2.27), built by
+#                            rockboxdev/rockboxdev.sh: an hour or so, once.
+#                            TOOLCHAIN_DIR=... uses one built elsewhere.
+#   deps/lvgl/               LVGL $(LVGL_VER), cloned (the folder has to be
+#                            called lvgl: sources include "lvgl/lvgl.h")
+#   deps/freetype-target/    FreeType $(FT_VER), static, for the MiSans face
+#                            (src/style.c); the simulator gets a host build of
+#                            the same source in build/host-freetype/
+# LVGL is built once into build/lvgl/ and shared by both models.
 
 MODEL ?= r1
 
-PLAYER_DIR ?= $(CURDIR)/../sonix-player/sonix-player
-LVGL_DIR ?= $(PLAYER_DIR)/lvgl
-CROSS ?= $(PLAYER_DIR)/rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-
-# FreeType, for the MiSans face (src/style.c): the player's cross build of it
-# (made by its `make target`), and for the simulator a host build of the same
-# source, made here out of tree (the player's folder is not touched).
-FT_TARGET = $(PLAYER_DIR)/freetype-target
-FT_SRC = $(PLAYER_DIR)/freetype-2.13.3
+DEPS = $(CURDIR)/deps
+LVGL_VER = 9.6.0
+# the commit tag v$(LVGL_VER) has to point to
+LVGL_COMMIT = 80ca777e37a2b176770726a02e07a6fb79ef0b39
+LVGL_DIR ?= $(DEPS)/lvgl
+TOOLCHAIN_DIR ?= $(DEPS)/rockbox-toolchain
+CROSS ?= $(TOOLCHAIN_DIR)/bin/mipsel-rockbox-linux-gnu-
+FT_VER = 2.13.3
+FT_SHA256 = 0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289
+FT_TARBALL = $(DEPS)/freetype-$(FT_VER).tar.xz
+FT_URL = https://download.savannah.gnu.org/releases/freetype/freetype-$(FT_VER).tar.xz
+FT_URL_MIRROR = https://downloads.sourceforge.net/project/freetype/freetype2/$(FT_VER)/freetype-$(FT_VER).tar.xz
+FT_SRC = $(DEPS)/freetype-$(FT_VER)
+FT_TARGET = $(DEPS)/freetype-target
+# The face the recovery draws with: MiSans Regular, bundled into the root fs
+# by pack_recovery.sh and used by the simulator.
+FONT = $(CURDIR)/assets/fonts/default.otf
 CC = $(CROSS)gcc
 STRIP = $(CROSS)strip
 READELF = $(CROSS)readelf
+
+# LVGL is cloned before the source list below is read (not for `make clean`
+# or `make distclean`), and has to be the pinned commit: a moved tag or a
+# tampered clone stops the build.
+ifeq ($(filter clean distclean,$(MAKECMDGOALS)),)
+ifeq ($(wildcard $(LVGL_DIR)/lvgl.h),)
+$(info cloning LVGL v$(LVGL_VER) into $(LVGL_DIR))
+$(shell mkdir -p $(DEPS) && git clone -q --depth 1 -b v$(LVGL_VER) https://github.com/lvgl/lvgl.git $(LVGL_DIR) >&2)
+endif
+ifneq ($(origin LVGL_DIR),command line)
+LVGL_HAVE := $(shell git -C $(LVGL_DIR) rev-parse HEAD 2>/dev/null)
+ifneq ($(LVGL_HAVE),$(LVGL_COMMIT))
+$(error $(LVGL_DIR) is at '$(LVGL_HAVE)', not v$(LVGL_VER) ($(LVGL_COMMIT)): remove it (make distclean) to clone it again)
+endif
+endif
+endif
 
 ifeq ($(MODEL),r1)
 MODEL_DEF = -DMODEL_R1
@@ -37,21 +69,33 @@ $(error MODEL must be r1 or r3proii)
 endif
 
 VERSION := $(shell git -C $(CURDIR) describe --always --dirty 2>/dev/null || echo unknown)
+# The version is passed with -D, which make does not see as an input: it is
+# also kept in build/version.txt, rewritten only when it changes, and the
+# files that print it depend on that (below), so a new commit rebuilds them.
+VERSION_STAMP = build/version.txt
+ifeq ($(filter clean distclean,$(MAKECMDGOALS)),)
+ifneq ($(file < $(VERSION_STAMP)),$(VERSION))
+$(shell mkdir -p build)
+$(file > $(VERSION_STAMP),$(VERSION))
+endif
+endif
 
-# -march=mips32r2 -mno-madd4, glibc_compat.h: the player's reasons, see its
-# Makefile. The device has glibc 2.22, the toolchain 2.27; check-abi below
-# catches a symbol the device would not have.
+# -march=mips32r2: the toolchain is configured without --with-arch.
+# -mno-madd4: the X1600 has no fused multiply-add (madd.s/msub.s would trap).
+# src/glibc_compat.h: the device has glibc 2.22, the toolchain 2.27; it pins
+# the old symbol versions, and check-abi below catches one the device would
+# not have.
 CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -MMD -MP -D_FILE_OFFSET_BITS=64 \
 		 -march=mips32r2 -mno-madd4 -ffunction-sections -fdata-sections \
-		 -include $(PLAYER_DIR)/src/system/core/glibc_compat.h \
+		 -include $(CURDIR)/src/glibc_compat.h \
 		 -I$(CURDIR) -I$(LVGL_DIR)/.. -I$(LVGL_DIR) -I$(FT_TARGET)/include/freetype2 -DLV_CONF_INCLUDE_SIMPLE=1
 LVGL_CFLAGS = $(filter-out -Wextra -Wno-unused-parameter,$(CFLAGS)) -w
-APP_CFLAGS = $(CFLAGS) $(MODEL_DEF) -DSONIX_RECOVERY_VERSION='"$(VERSION)"'
+APP_CFLAGS = $(CFLAGS) $(MODEL_DEF) -DZEES_RECOVERY_VERSION='"$(VERSION)"'
 LDFLAGS = -static-libgcc -Wl,--gc-sections
 LDLIBS = $(FT_TARGET)/lib/libfreetype.a -lpthread -lm
 
 BUILD = build/$(MODEL)
-BIN = $(BUILD)/sonix_recovery
+BIN = $(BUILD)/zees_recovery
 
 ALL_SRCS := $(wildcard src/*.c)
 APP_SRCS := $(ALL_SRCS)
@@ -65,14 +109,49 @@ HW_SRCS := src/device.c src/storage.c src/input.c
 APP_SRCS := $(filter-out $(SIM_SRCS),$(APP_SRCS))
 APP_OBJS = $(APP_SRCS:src/%.c=$(BUILD)/%.o)
 
-.PHONY: all clean check-abi host shots
+.PHONY: all clean distclean check-abi host shots toolchain
 all: $(BIN)
 
 $(LVGL_DIR)/lvgl.h:
-	@echo "no LVGL in $(LVGL_DIR): run 'make target' in $(PLAYER_DIR) first" >&2; exit 1
+	@echo "no LVGL in $(LVGL_DIR) (the clone failed?)" >&2; exit 1
 
-$(FT_TARGET)/lib/libfreetype.a:
-	@echo "no $@: run 'make target' in $(PLAYER_DIR) first (it builds FreeType)" >&2; exit 1
+# The toolchain, once (rockboxdev.sh downloads and builds binutils, GCC and
+# glibc; its scratch goes in build/rbdev/). Only a prerequisite when CC is
+# that toolchain's own: a CROSS= or CC= pointing elsewhere is used as it is.
+TOOLCHAIN_GCC = $(TOOLCHAIN_DIR)/bin/mipsel-rockbox-linux-gnu-gcc
+TOOLCHAIN_DEP = $(filter $(TOOLCHAIN_GCC),$(CC))
+
+toolchain: $(TOOLCHAIN_GCC)
+
+$(TOOLCHAIN_GCC):
+	@echo "building the cross toolchain into $(TOOLCHAIN_DIR) (once; this takes a while)"
+	@mkdir -p build/rbdev
+	cd build/rbdev && RBDEV_HOST_PREFIX=$(TOOLCHAIN_DIR) $(CURDIR)/rockboxdev/rockboxdev.sh
+
+$(FT_TARBALL):
+	@mkdir -p $(DEPS)
+	wget -q -O $@.part $(FT_URL) || wget -q -O $@.part $(FT_URL_MIRROR)
+	echo "$(FT_SHA256)  $@.part" | sha256sum -c --quiet - || \
+		{ rm -f $@.part; echo "$(FT_TARBALL): not the FreeType $(FT_VER) release (sha256)" >&2; exit 1; }
+	mv $@.part $@
+
+$(FT_SRC)/configure: $(FT_TARBALL)
+	rm -rf $(FT_SRC) && tar -C $(DEPS) -xf $(FT_TARBALL) && touch $@
+
+# FreeType for the device, static (the root fs has no libfreetype.so), built
+# out of tree so the host build can use the same source. configure wants the
+# toolchain on PATH to find ar and ranlib under their triplet names.
+$(FT_TARGET)/lib/libfreetype.a: $(FT_SRC)/configure | $(TOOLCHAIN_DEP)
+	@echo "building FreeType $(FT_VER) for the device into $(FT_TARGET)"
+	@rm -rf build/target-freetype && mkdir -p build/target-freetype
+	@cd build/target-freetype && PATH="$(TOOLCHAIN_DIR)/bin:$$PATH" sh $(FT_SRC)/configure \
+		--host=mipsel-rockbox-linux-gnu --prefix=$(FT_TARGET) --disable-shared --enable-static \
+		--with-zlib=no --with-bzip2=no --with-png=no --with-harfbuzz=no --with-brotli=no \
+		CC=$(CC) CFLAGS="-O2 -march=mips32r2 -mplt" AR=$(CROSS)ar RANLIB=$(CROSS)ranlib \
+		>configure.log 2>&1 && \
+		PATH="$(TOOLCHAIN_DIR)/bin:$$PATH" $(MAKE) >make.log 2>&1 && \
+		PATH="$(TOOLCHAIN_DIR)/bin:$$PATH" $(MAKE) install >install.log 2>&1 || \
+		{ echo "FreeType device build failed, see build/target-freetype/*.log" >&2; exit 1; }
 
 $(APP_OBJS) $(LVGL_OBJS): | $(FT_TARGET)/lib/libfreetype.a
 
@@ -96,7 +175,7 @@ check-abi:
 		awk -F'[_.]' '$$2 > 2 || ($$2 == 2 && $$3 > 22)'); \
 	if [ -n "$$bad" ]; then \
 		echo "*** $(BIN) needs glibc symbols the device (2.22) does not have:" $$bad; \
-		echo "*** add a .symver to $(PLAYER_DIR)/src/system/core/glibc_compat.h"; \
+		echo "*** add a .symver to src/glibc_compat.h"; \
 		rm -f $(BIN); exit 1; \
 	fi; echo "check-abi: nothing beyond glibc 2.22"
 
@@ -109,14 +188,14 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
 SDL_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null)
 HAVE_SDL := $(if $(SDL_LIBS),1,0)
 HOST_BUILD_DIR = build/host-$(MODEL)
-HOST_BIN = $(HOST_BUILD_DIR)/sonix_recovery_sim
+HOST_BIN = $(HOST_BUILD_DIR)/zees_recovery_sim
 HOST_FT = $(CURDIR)/build/host-freetype/install
 HOST_CFLAGS_BASE = -O1 -g -Wall -MMD -MP -D_FILE_OFFSET_BITS=64 -DHOST_BUILD=1 -DSIM_HAVE_SDL=$(HAVE_SDL) \
 				   -I$(CURDIR) -I$(LVGL_DIR)/.. -I$(LVGL_DIR) -I$(HOST_FT)/include/freetype2 \
 				   -DLV_CONF_INCLUDE_SIMPLE=1 $(SDL_CFLAGS)
 HOST_CFLAGS = $(HOST_CFLAGS_BASE) -Wextra -Wno-unused-parameter -Wno-format-truncation $(MODEL_DEF) \
-			  -DSONIX_RECOVERY_VERSION='"$(VERSION) (simulator)"' \
-			  -DSIM_FONT_FILE='"$(PLAYER_DIR)/assets/fonts/default.otf"'
+			  -DZEES_RECOVERY_VERSION='"$(VERSION) (simulator)"' \
+			  -DSIM_FONT_FILE='"$(FONT)"'
 HOST_SRCS = $(filter-out $(HW_SRCS),$(ALL_SRCS))
 HOST_OBJS = $(HOST_SRCS:src/%.c=$(HOST_BUILD_DIR)/%.o)
 # LVGL's objects depend on whether SDL is in, not on the model.
@@ -125,7 +204,7 @@ HOST_LVGL_OBJS = $(LVGL_SRCS:$(LVGL_DIR)/src/%.c=$(HOST_LVGL_DIR)/%.o)
 
 host: $(HOST_BIN)
 
-$(HOST_FT)/lib/libfreetype.a:
+$(HOST_FT)/lib/libfreetype.a: $(FT_SRC)/configure
 	@echo "building FreeType for the host in build/host-freetype"
 	@rm -rf build/host-freetype && mkdir -p build/host-freetype/obj
 	@cd build/host-freetype/obj && sh $(FT_SRC)/configure --prefix=$(HOST_FT) --disable-shared --enable-static \
@@ -150,9 +229,17 @@ $(HOST_LVGL_DIR)/%.o: $(LVGL_DIR)/src/%.c lv_conf.h
 
 shots: $(HOST_BIN)
 	rm -rf build/shots-$(MODEL)
-	cd $(HOST_BUILD_DIR) && ./sonix_recovery_sim --shots $(CURDIR)/build/shots-$(MODEL)
+	cd $(HOST_BUILD_DIR) && ./zees_recovery_sim --shots $(CURDIR)/build/shots-$(MODEL)
 
+# build/ only: deps/ (toolchain, LVGL, FreeType) stays, `make distclean` too.
 clean:
 	rm -rf build
+
+distclean: clean
+	rm -rf $(DEPS)
+
+# The sources that print the version (ZEES_RECOVERY_VERSION).
+VERSIONED = main backup ui
+$(VERSIONED:%=$(BUILD)/%.o) $(VERSIONED:%=$(HOST_BUILD_DIR)/%.o): $(VERSION_STAMP)
 
 -include $(APP_OBJS:.o=.d) $(LVGL_OBJS:.o=.d) $(HOST_OBJS:.o=.d) $(HOST_LVGL_OBJS:.o=.d)

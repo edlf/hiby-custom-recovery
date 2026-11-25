@@ -1,5 +1,13 @@
 #include "device.h"
 
+// Overridable to try this file on a PC against a made-up flash.
+#ifndef PROC_MTD
+#define PROC_MTD "/proc/mtd"
+#endif
+#ifndef MTD_DEV_FMT
+#define MTD_DEV_FMT "/dev/mtd%d"
+#endif
+
 #include "bootloader.h"
 #include "log.h"
 
@@ -19,7 +27,7 @@
 #include <unistd.h>
 
 int mtd_find(const char *name, char *dev, size_t dev_size) {
-	FILE *f = fopen("/proc/mtd", "r");
+	FILE *f = fopen(PROC_MTD, "r");
 	if (!f) {
 		return -1;
 	}
@@ -32,7 +40,7 @@ int mtd_find(const char *name, char *dev, size_t dev_size) {
 		int n;
 		char *q = strchr(line, '"');
 		if (q && sscanf(line, "mtd%d:", &n) == 1 && strncmp(q, want, strlen(want)) == 0) {
-			snprintf(dev, dev_size, "/dev/mtd%d", n);
+			snprintf(dev, dev_size, MTD_DEV_FMT, n);
 			found = n;
 			break;
 		}
@@ -43,7 +51,7 @@ int mtd_find(const char *name, char *dev, size_t dev_size) {
 
 // Size of /dev/mtdN, from /proc/mtd.
 long long mtd_part_size(int num) {
-	FILE *f = fopen("/proc/mtd", "r");
+	FILE *f = fopen(PROC_MTD, "r");
 	if (!f) {
 		return -1;
 	}
@@ -292,7 +300,7 @@ int device_factory_reset(bool keep_media_db) {
 }
 
 int mtd_list(mtd_part_t *out, int max) {
-	FILE *f = fopen("/proc/mtd", "r");
+	FILE *f = fopen(PROC_MTD, "r");
 	if (!f) {
 		return -1;
 	}
@@ -317,7 +325,7 @@ int mtd_list(mtd_part_t *out, int max) {
 
 int mtd_open_ro(int num) {
 	char dev[32];
-	snprintf(dev, sizeof(dev), "/dev/mtd%d", num);
+	snprintf(dev, sizeof(dev), MTD_DEV_FMT, num);
 	return open(dev, O_RDONLY);
 }
 
@@ -325,47 +333,6 @@ int mtd_block_bad(int fd, long long off) {
 	loff_t o = off;
 	int r = ioctl(fd, MEMGETBADBLOCK, &o);
 	return r < 0 ? -1 : r > 0;
-}
-
-long long mtd_ecc_failed(int fd) {
-	struct mtd_ecc_stats st;
-	return ioctl(fd, ECCGETSTATS, &st) == 0 ? (long long)st.failed : -1;
-}
-
-void theme_marker_read(char *out, size_t size) {
-	char dev[32];
-	out[0] = '\0';
-	int num = mtd_find("ota", dev, sizeof(dev));
-	int fd = num >= 0 ? open(dev, O_RDONLY) : -1;
-	if (fd < 0) {
-		return;
-	}
-	size_t want = size - 1 < 13 ? size - 1 : 13;
-	ssize_t n = pread(fd, out, want, 0x20000);
-	close(fd);
-	out[n > 0 ? n : 0] = '\0';
-	for (char *p = out; *p; p++) {
-		if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7e) { // erased flash, 0xff
-			*p = '\0';
-			break;
-		}
-	}
-}
-
-int mtd_open_rw(int num) {
-	char dev[32];
-	snprintf(dev, sizeof(dev), "/dev/mtd%d", num);
-	return open(dev, O_RDWR);
-}
-
-int mtd_erase_block(int fd, long long off, unsigned size) {
-	struct erase_info_user ei = {.start = (uint32_t)off, .length = size};
-	return ioctl(fd, MEMERASE, &ei) == 0 ? 0 : -1;
-}
-
-unsigned mtd_writesize(int fd) {
-	struct mtd_info_user info;
-	return ioctl(fd, MEMGETINFO, &info) == 0 ? info.writesize : 0;
 }
 
 int userdata_release(int num) {
@@ -394,23 +361,16 @@ static int uboot_dev(char *dev, size_t size) { return mtd_find("uboot", dev, siz
 
 int uboot_part_read(uint8_t *buf, size_t len) {
 	char dev[32];
-	if (uboot_dev(dev, sizeof(dev)) != 0) {
+	int num = mtd_find("uboot", dev, sizeof(dev));
+	if (num < 0) {
 		return -1;
 	}
-	int fd = open(dev, O_RDONLY);
-	if (fd < 0) {
+	mtd_dump_t *d = mtd_dump_begin(num, (long long)len);
+	if (!d) {
 		return -1;
 	}
-	size_t got = 0;
-	while (got < len) {
-		ssize_t n = read(fd, buf + got, len - got);
-		if (n <= 0) {
-			break;
-		}
-		got += (size_t)n;
-	}
-	close(fd);
-	return got == len ? 0 : -1;
+	int rc = mtd_dump_read(d, buf, len);
+	return (mtd_dump_end(d, NULL) == 0 && rc == 0) ? 0 : -1;
 }
 
 int uboot_part_write(const char *file) {
@@ -453,27 +413,203 @@ int uboot_part_bad_blocks(void) {
 
 const char *bootloader_dir(void) { return BOOTLOADER_DIR; }
 
-#define SQ_MOUNT "/tmp/sqcheck"
+int device_start_adb(void) { return run("/etc/init.d/T90adb start"); }
 
-int squashfs_read_file(const char *image, const char *path, char *out, size_t size) {
-	char q[600];
-	mkdir(SQ_MOUNT, 0755);
-	if (run("mount -o loop,ro -t squashfs %s " SQ_MOUNT, shq(image, q, sizeof(q))) != 0) {
+static int led_trigger(const char *led, const char *trigger) {
+	char path[64];
+	snprintf(path, sizeof(path), "/sys/class/leds/%s/trigger", led);
+	FILE *f = fopen(path, "w");
+	if (!f) {
 		return -1;
 	}
-	char full[300];
-	snprintf(full, sizeof(full), SQ_MOUNT "/%s", path);
-	int n = -1;
-	FILE *f = fopen(full, "r");
-	if (f) {
-		n = (int)fread(out, 1, size - 1, f);
-		out[n] = '\0';
-		fclose(f);
-	}
-	if (umount(SQ_MOUNT) != 0) {
-		LOG("squashfs: umount " SQ_MOUNT " failed");
-	}
-	return n;
+	int rc = fputs(trigger, f) >= 0 ? 0 : -1;
+	return fclose(f) == 0 ? rc : -1;
 }
 
-int device_start_adb(void) { return run("/etc/init.d/T90adb start"); }
+void device_leds_purple(void) {
+	static const char *const leds[] = {"red", "blue"};
+	int ok = 0;
+	for (int i = 0; i < 2; i++) {
+		led_trigger(leds[i], "none");
+	}
+	for (int i = 0; i < 2; i++) {
+		if (led_trigger(leds[i], "breathing") == 0) {
+			ok++;
+		} else {
+			LOG("leds: %s: cannot set the breathing trigger (%s)", leds[i], strerror(errno));
+		}
+	}
+	LOG("leds: %d of 2 breathing (purple)", ok);
+}
+
+// ---------------------------------------------------------------------------
+// Images, through flash_erase and nandwrite (device.h)
+
+#define NANDWRITE_LOG "/tmp/nandwrite.log"
+
+struct mtd_image_writer {
+	FILE *p;
+	long long size, sent;
+	bool failed;
+};
+
+static void log_nandwrite(void) {
+	FILE *f = fopen(NANDWRITE_LOG, "r");
+	if (!f) {
+		return;
+	}
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		if (line[0]) {
+			LOG("nandwrite| %s", line);
+		}
+	}
+	fclose(f);
+}
+
+mtd_image_writer_t *mtd_image_begin(int num, long long size, unsigned flags) {
+	char dev[32];
+	snprintf(dev, sizeof(dev), MTD_DEV_FMT, num);
+	if (run("flash_erase %s 0 0 >/dev/null", dev) != 0) {
+		LOG("image: erasing %s failed", dev);
+		return NULL;
+	}
+	mtd_image_writer_t *w = calloc(1, sizeof(*w));
+	if (!w) {
+		return NULL;
+	}
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd), "nandwrite%s%s -p --input-size=%lld %s - >" NANDWRITE_LOG " 2>&1",
+			 (flags & MTD_IMAGE_MARKBAD) ? " -m" : "", (flags & MTD_IMAGE_SKIP_FF) ? " -k" : "", size, dev);
+	LOG("image: %s", cmd);
+	w->p = popen(cmd, "w");
+	if (!w->p) {
+		free(w);
+		return NULL;
+	}
+	w->size = size;
+	return w;
+}
+
+int mtd_image_write(mtd_image_writer_t *w, const void *buf, size_t len) {
+	if (w->failed || fwrite(buf, 1, len, w->p) != len) {
+		w->failed = true; // nandwrite has gone (SIGPIPE is ignored, see main.c)
+		return -1;
+	}
+	w->sent += (long long)len;
+	return 0;
+}
+
+int mtd_image_end(mtd_image_writer_t *w) {
+	if (!w) {
+		return -1;
+	}
+	int st = pclose(w->p);
+	int rc = (!w->failed && w->sent == w->size && st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+	if (rc != 0) {
+		LOG("image: nandwrite failed (status %d, %lld of %lld bytes sent)", st, w->sent, w->size);
+	}
+	log_nandwrite();
+	free(w);
+	return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Reading, through nanddump (device.h)
+
+#define NANDDUMP_LOG "/tmp/nanddump.log"
+
+struct mtd_dump {
+	FILE *p;
+	long long length, got;
+	bool failed;
+};
+
+mtd_dump_t *mtd_dump_begin(int num, long long length) { return mtd_dump_begin_at(num, 0, length); }
+
+mtd_dump_t *mtd_dump_begin_at(int num, long long start, long long length) {
+	if (length <= 0) {
+		length = mtd_part_size(num) - start;
+	}
+	if (length <= 0) {
+		return NULL;
+	}
+	mtd_dump_t *d = calloc(1, sizeof(*d));
+	if (!d) {
+		return NULL;
+	}
+	char dev[32], cmd[256];
+	snprintf(dev, sizeof(dev), MTD_DEV_FMT, num);
+	// -a: binary to a pipe without complaint. Its messages (bad blocks, ECC,
+	// the summary) go to the log, read by mtd_dump_end().
+	snprintf(cmd, sizeof(cmd), "nanddump -a --bb=padbad -s %lld -l %lld %s 2>" NANDDUMP_LOG, start, length, dev);
+	LOG("dump: %s", cmd);
+	d->p = popen(cmd, "r");
+	if (!d->p) {
+		free(d);
+		return NULL;
+	}
+	d->length = length;
+	return d;
+}
+
+int mtd_dump_read(mtd_dump_t *d, void *buf, size_t len) {
+	if (d->failed || fread(buf, 1, len, d->p) != len) {
+		d->failed = true;
+		return -1;
+	}
+	d->got += (long long)len;
+	return 0;
+}
+
+int mtd_dump_end(mtd_dump_t *d, mtd_dump_stats_t *st) {
+	if (!d) {
+		return -1;
+	}
+	// The rest of what it gives, so it can finish (it is not killed by a
+	// closed pipe halfway, which would look like a failure).
+	char sink[4096];
+	size_t n;
+	while (!d->failed && (n = fread(sink, 1, sizeof(sink), d->p)) > 0) {
+		d->got += (long long)n; // read, just not needed: not a failure
+	}
+	int status = pclose(d->p);
+	int rc = (!d->failed && d->got == d->length && status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+				 ? 0
+				 : -1;
+	mtd_dump_stats_t s = {0, 0};
+	long long summary = -1;
+	FILE *f = fopen(NANDDUMP_LOG, "r");
+	if (f) {
+		char line[256];
+		long long v;
+		while (fgets(line, sizeof(line), f)) {
+			line[strcspn(line, "\r\n")] = '\0';
+			if (strncmp(line, "Bad block at", 12) == 0) {
+				s.bad_blocks++;
+				LOG("nanddump| %s (given as 0xff)", line);
+			} else if (strstr(line, "uncorrectable bitflip")) {
+				s.ecc_failed++;
+				LOG("nanddump| %s", line);
+			} else if (sscanf(line, "ECC failed: %lld", &v) == 1) {
+				summary = v;
+			} else if (rc != 0 && line[0]) {
+				LOG("nanddump| %s", line);
+			}
+		}
+		fclose(f);
+	}
+	if (summary > s.ecc_failed) {
+		s.ecc_failed = summary;
+	}
+	if (rc != 0) {
+		LOG("dump: nanddump failed (status %d, %lld of %lld bytes)", status, d->got, d->length);
+	}
+	if (st) {
+		*st = s;
+	}
+	free(d);
+	return rc;
+}
+

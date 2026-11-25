@@ -1,6 +1,7 @@
-// Sonix Recovery: replaces HiBy's /usr/bin/recoveryd on the recovery root fs
+// Zee's Recovery: replaces HiBy's /usr/bin/recoveryd on the recovery root fs
 // (rootfs2), started by /etc/init.d/S92_03_start_recovery. See README.md.
 
+#include "device.h"
 #include "input.h"
 #include "log.h"
 #include "model.h"
@@ -31,9 +32,10 @@ int main(int argc, char **argv) {
 	(void)argc;
 	(void)argv;
 	log_open();
-	LOG("Sonix Recovery %s for the %s", SONIX_RECOVERY_VERSION, g_model.name);
+	LOG("Zee's Recovery %s for the %s", ZEES_RECOVERY_VERSION, g_model.name);
 	// A popen()ed writer that dies must not take this process with it.
 	signal(SIGPIPE, SIG_IGN);
+	device_leds_purple();
 
 	lv_init();
 	lv_tick_set_cb(tick_ms);
