@@ -22,6 +22,11 @@ int bootflag_write(boot_target_t target);
 // Record "ota:kernel" plus the fastboot request on page 1.
 int bootflag_request_fastboot(void);
 const char *boot_target_name(boot_target_t t);
+// Erases the whole "ota" partition: the record, a fastboot request, and the
+// player's boot logo marker at 0x20000 (the default logo comes back). Both
+// bootloaders start the normal system from a blank record.
+// 0 when it reads back blank.
+int ota_wipe(void);
 
 // /dev/mtdN of the partition called `name` (the first one with that name:
 // the stock table calls both root fs "rootfs"). -1 when there is none.

@@ -104,6 +104,32 @@ int bootflag_request_fastboot(void) {
 	return write_record("ota:kernel");
 }
 
+// The record file empty (an erased page), and $SIM_DIR/mtd5 all 0xff.
+int ota_wipe(void) {
+	char p[512];
+	sim_path(p, sizeof(p), "ota");
+	FILE *f = fopen(p, "w");
+	if (!f) {
+		return -1;
+	}
+	fclose(f);
+	char dev[32];
+	int num = mtd_find("ota", dev, sizeof(dev));
+	if (num >= 0) {
+		snprintf(dev, sizeof(dev), "mtd%d", num);
+		sim_path(p, sizeof(p), dev);
+		FILE *m = fopen(p, "wb");
+		if (m) {
+			for (long long i = 0; i < PARTS[num].size; i++) {
+				fputc(0xff, m);
+			}
+			fclose(m);
+		}
+	}
+	LOG("sim: flash_erase ota 0 0");
+	return bootflag_read() == BOOT_UNKNOWN ? 0 : -1;
+}
+
 void battery_read(battery_t *out) {
 	const char *b = getenv("SIM_BATTERY");
 	out->capacity = b ? atoi(b) : 80;

@@ -21,6 +21,10 @@ The first page of the `ota` MTD partition is the **boot record**:
 
 - `ota:kernel` boots the normal system.
 - `ota:kernel2` boots the recovery (kernel2 + rootfs2).
+- A blank record (after **Wipe OTA partition**, Advanced) boots the normal
+  system too, with both bootloaders. The wipe erases the whole partition:
+  the record, a fastboot request on page 1, and the player's boot logo
+  marker at 0x20000.
 
 The SPL boots the recovery when:
 

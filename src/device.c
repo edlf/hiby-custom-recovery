@@ -130,6 +130,18 @@ int bootflag_request_fastboot(void) {
 	return run("printf '%%-256s' 'ota:fastboot' | nandwrite -s 2048 -p %s -", dev) == 0 ? 0 : -1;
 }
 
+int ota_wipe(void) {
+	char dev[32];
+	if (mtd_find("ota", dev, sizeof(dev)) < 0) {
+		LOG("ota: no \"ota\" partition");
+		return -1;
+	}
+	int rc = run("flash_erase %s 0 0", dev);
+	boot_target_t now = bootflag_read();
+	LOG("ota: wiped (%s), record now %s", rc == 0 ? "ok" : "flash_erase failed", boot_target_name(now));
+	return (rc == 0 && now == BOOT_UNKNOWN) ? 0 : -1;
+}
+
 static int read_int_file(const char *path, int *out) {
 	FILE *f = fopen(path, "r");
 	if (!f) {
