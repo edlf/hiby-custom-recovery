@@ -34,13 +34,19 @@ static const char *sim_dir(void) {
 
 static void sim_path(char *out, size_t size, const char *name) { snprintf(out, size, "%s/%s", sim_dir(), name); }
 
-// The stock table, the same on both players.
+// The stock tables: the same layout on both players; the recovery's root fs
+// is a second "rootfs" on the R1 and "rootfs2" on the R3 Pro II.
+#ifdef MODEL_R3PROII
+#define SIM_ROOTFS2 "rootfs2"
+#else
+#define SIM_ROOTFS2 "rootfs"
+#endif
 static const struct {
 	const char *name;
 	long long size;
 } PARTS[] = {
-	{"uboot", 0x80000},	   {"kernel", 0x500000}, {"rootfs", 0x2d00000}, {"kernel2", 0x500000},
-	{"rootfs", 0x1800000}, {"ota", 0x80000},	 {"userdata", 0x2d00000}, // truncated to the chip, as on the R1
+	{"uboot", 0x80000},		 {"kernel", 0x500000}, {"rootfs", 0x2d00000}, {"kernel2", 0x500000},
+	{SIM_ROOTFS2, 0x1800000}, {"ota", 0x80000},	   {"userdata", 0x2d00000}, // truncated to the chip, as on the R1
 };
 #define N_PARTS (int)(sizeof(PARTS) / sizeof(PARTS[0]))
 

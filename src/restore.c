@@ -114,10 +114,19 @@ int restore_list_backups(backup_entry_t *out, int max) {
 	return n;
 }
 
-// The running recovery: kernel2, and the rootfs that is not the first one.
+// The recovery's root fs is "rootfs2" in the R3 Pro II's stock table and a
+// second "rootfs" in the R1's (where it may be renamed "rootfs2" too): the two
+// names are the same partition, for telling the partitions apart and for
+// matching a backup against the table it was made with.
+static const char *canon_name(const char *name) { return strcmp(name, "rootfs2") == 0 ? "rootfs" : name; }
+
+static bool same_name(const char *a, const char *b) { return strcmp(canon_name(a), canon_name(b)) == 0; }
+
+// The running recovery: kernel2, and its root fs: "rootfs2", or a "rootfs"
+// that is not the first one (the first is the system's).
 static bool is_recovery_part(const mtd_part_t *p) {
 	char dev[32];
-	if (strcmp(p->name, "kernel2") == 0) {
+	if (strcmp(p->name, "kernel2") == 0 || strcmp(p->name, "rootfs2") == 0) {
 		return true;
 	}
 	return strcmp(p->name, "rootfs") == 0 && mtd_find("rootfs", dev, sizeof(dev)) != p->num;
@@ -158,7 +167,7 @@ int restore_scan(const char *dir, restore_part_t *out, int max) {
 				c = &cur[i];
 			}
 		}
-		if (!c || strcmp(c->name, r->name) != 0 || c->size != r->size) {
+		if (!c || !same_name(c->name, r->name) || c->size != r->size) {
 			snprintf(r->why_not, sizeof(r->why_not), "not this player's mtd%d", num);
 		} else if (is_recovery_part(c)) {
 			snprintf(r->why_not, sizeof(r->why_not), "the running recovery: use fastboot");
@@ -217,7 +226,7 @@ static bool mtd_txt_matches(const char *dir) {
 	}
 	mtd_part_t cur[RESTORE_MAX_PARTS];
 	int nc = mtd_list(cur, RESTORE_MAX_PARTS), i = 0;
-	char line[160], want[160];
+	char line[160];
 	bool ok = nc > 0 && fgets(line, sizeof(line), f) != NULL; // header
 	while (ok && fgets(line, sizeof(line), f)) {
 		line[strcspn(line, "\r\n")] = '\0';
@@ -228,9 +237,13 @@ static bool mtd_txt_matches(const char *dir) {
 			ok = false;
 			break;
 		}
-		snprintf(want, sizeof(want), "mtd%d: %08llx %08x \"%s\"", cur[i].num, cur[i].size, cur[i].erasesize,
-				 cur[i].name);
-		ok = strcmp(line, want) == 0;
+		// the same line, but "rootfs2" may stand where the other has "rootfs"
+		unsigned long long sz;
+		unsigned int es;
+		int num;
+		char name[64];
+		ok = sscanf(line, "mtd%d: %llx %x \"%63[^\"]\"", &num, &sz, &es, name) == 4 && num == cur[i].num &&
+			 (long long)sz == cur[i].size && es == cur[i].erasesize && same_name(name, cur[i].name);
 		i++;
 	}
 	fclose(f);

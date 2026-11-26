@@ -469,6 +469,9 @@ static const char *part_title(const restore_part_t *p) {
 	if (strcmp(p->name, "kernel") == 0) {
 		return "Kernel";
 	}
+	if (strcmp(p->name, "rootfs2") == 0) {
+		return "Recovery system";
+	}
 	if (strcmp(p->name, "rootfs") == 0) {
 		return p->restorable || strstr(p->why_not, "recovery") == NULL ? "System" : "Recovery system";
 	}
@@ -683,7 +686,7 @@ static void show_restore_parts(void) {
 		if (strstr(rparts[i].why_not, "fastboot")) { // kernel2, the second rootfs
 			size_t l = strlen(fb);
 			snprintf(fb + l, sizeof(fb) - l, "%s%s", l ? "/" : "",
-					 strcmp(rparts[i].name, "kernel2") == 0 ? "kernel" : rparts[i].name);
+					 strcmp(rparts[i].name, "kernel2") == 0 ? "kernel" : "rootfs"); // rootfs or rootfs2
 		} else {
 			snprintf(text, sizeof(text), "%s: %s", part_title(&rparts[i]), rparts[i].why_not);
 			label(scr, text, F20, S.dim);
