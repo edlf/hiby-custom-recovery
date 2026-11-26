@@ -21,6 +21,10 @@ The first page of the `ota` MTD partition is the **boot record**:
 
 - `ota:kernel` boots the normal system.
 - `ota:kernel2` boots the recovery (kernel2 + rootfs2).
+- A blank record (after **Wipe OTA partition**, Advanced) boots the normal
+  system too, with both bootloaders. The wipe erases the whole partition:
+  the record, a fastboot request on page 1, and the player's boot logo
+  marker at 0x20000.
 
 The SPL boots the recovery when:
 
@@ -176,7 +180,7 @@ from them (use fastboot instead).
 
 Before anything is written, it checks:
 
-- `info.txt` names this player, and `mtd.txt` matches its partition table line for line.
+- `info.txt` names this player, and `mtd.txt` matches its partition table line for line. The recovery's root fs counts as the same partition whether it's called `rootfs2` (the R3 Pro II's stock name) or a second `rootfs` (the R1's), so a backup still matches if the table was renamed since.
 - Each chosen file matches its md5 in `md5sums.txt` and the partition's size.
 - No block has gone bad since the backup where the backup has data (that partition is refused, since the data wouldn't land in the right place).
 - For user data: `/usr/data` is unmounted and its UBI detached (refused if in use).
@@ -281,7 +285,7 @@ The stock recovery (kernel2 + rootfs2) isn't in HiBy's `.upt` files; it has
 to come from the player's flash. From a root adb shell on stock firmware:
 
 ```sh
-adb shell cat /proc/mtd                            # mtd4 must be the second "rootfs"
+adb shell cat /proc/mtd                            # mtd4 must be "rootfs2" (or a second "rootfs")
 mkdir -p ~/r1-mtd && adb exec-out cat /dev/mtd4 > ~/r1-mtd/mtd4
 ```
 
@@ -370,8 +374,8 @@ SIM_FAIL_WRITE=1 recovery/build/host-r1/zees_recovery_sim --shots /tmp/shots \
 ## Flashing from the player
 
 Instead of fastboot, you can flash from a root shell on the player. On the
-R1, kernel2 is `mtd3` and rootfs2 is `mtd4` (the second `rootfs` in
-`/proc/mtd`):
+R1, kernel2 is `mtd3` and rootfs2 is `mtd4` (`rootfs2` in `/proc/mtd`,
+or a second `rootfs` with an older partition table):
 
 ```sh
 flash_erase /dev/mtd3 0 0 && nandwrite -p /dev/mtd3 kernel2-recovery.xImage

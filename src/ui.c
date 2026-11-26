@@ -469,6 +469,9 @@ static const char *part_title(const restore_part_t *p) {
 	if (strcmp(p->name, "kernel") == 0) {
 		return "Kernel";
 	}
+	if (strcmp(p->name, "rootfs2") == 0) {
+		return "Recovery system";
+	}
 	if (strcmp(p->name, "rootfs") == 0) {
 		return p->restorable || strstr(p->why_not, "recovery") == NULL ? "System" : "Recovery system";
 	}
@@ -683,7 +686,7 @@ static void show_restore_parts(void) {
 		if (strstr(rparts[i].why_not, "fastboot")) { // kernel2, the second rootfs
 			size_t l = strlen(fb);
 			snprintf(fb + l, sizeof(fb) - l, "%s%s", l ? "/" : "",
-					 strcmp(rparts[i].name, "kernel2") == 0 ? "kernel" : rparts[i].name);
+					 strcmp(rparts[i].name, "kernel2") == 0 ? "kernel" : "rootfs"); // rootfs or rootfs2
 		} else {
 			snprintf(text, sizeof(text), "%s: %s", part_title(&rparts[i]), rparts[i].why_not);
 			label(scr, text, F20, S.dim);
@@ -982,6 +985,20 @@ static void show_browser(void) {
 	(void)path;
 }
 
+static void do_wipe_ota(void) {
+	int rc = ota_wipe();
+	back_to = show_advanced;
+	show_message("Wipe OTA partition", rc == 0 ? "The ota partition is erased. The player will start the system."
+											   : "The ota partition could not be erased; see the log.");
+}
+
+static void wipe_ota(void) {
+	confirm("Wipe OTA partition",
+			"Erases the whole ota partition: the boot record, a pending fastboot request and the boot logo "
+			"setting. The player then starts the system.",
+			"Wipe", do_wipe_ota);
+}
+
 static void fastboot(void) {
 	confirm("Fastboot", "Reboots into USB fastboot (Zee's bootloader).",
 			"Reboot to fastboot", reboot_fastboot);
@@ -1053,6 +1070,7 @@ static void show_advanced(void) {
 	} else if (bootloader_can_install()) {
 		row(scr, "Install fastboot", confirm_bootloader, true);
 	}
+	row(scr, "Wipe OTA partition", wipe_ota, true);
 	row(scr, "Start ADB", adb, false);
 	button(scr, "Back", show_main, false);
 	lv_group_focus_obj(first);

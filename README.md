@@ -48,6 +48,7 @@ player installs an update, or after `fastboot reboot recovery`.
 | Restore backup | writes partitions back from a backup; you pick which (the bootloader only after a warning) |
 | Reboot to fastboot | only with Zee's bootloader |
 | Install fastboot | installs Zee's bootloader (R1 only, shown while HiBy's is installed) |
+| Wipe OTA partition | erases the `ota` partition (boot record, fastboot request, boot logo choice); the player then starts the system |
 | Start ADB | |
 
 Good to know:
