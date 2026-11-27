@@ -35,4 +35,14 @@ int storage_set_writable(bool rw);
 
 void storage_unmount(void);
 
+// USB mass storage (device.h): the card goes to the PC. storage_export()
+// unmounts it wherever it is mounted (0 when nothing is left mounted);
+// while exported storage_mount() refuses, so nothing here writes to a card
+// the PC is writing to. storage_card_disk() gives its whole-disk node
+// (/dev/mmcblk0), NULL without a card.
+int storage_export(void);
+void storage_unexport(void);
+bool storage_exported(void);
+const char *storage_card_disk(void);
+
 #endif /* STORAGE_H */

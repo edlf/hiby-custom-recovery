@@ -1004,6 +1004,27 @@ static void fastboot(void) {
 			"Reboot to fastboot", reboot_fastboot);
 }
 
+// USB storage: the card as a disk on the PC (device.h). A screen of its
+// own, with no way out but its button: nothing else here may use the card
+// while the PC has it, and turning it off is the moment to have ejected it.
+static void usb_storage_disable(void) {
+	device_usb_storage(false);
+	show_advanced();
+}
+
+static void show_usb_storage(void) {
+	if (device_usb_storage(true) != 0) {
+		show_message("USB storage", storage_card_present() ? "The card could not be put on USB; see the log."
+														   : "There is no card to put on USB.");
+		return;
+	}
+	page("USB storage");
+	back_allowed = false; // Power does nothing here: only the button ends it
+	label(scr, "Mass storage in use: the card is on the PC.", F24, S.text);
+	label(scr, "Safely eject it on the PC (Eject / Safely remove), then press Disable USB storage.", F24, S.dim);
+	lv_group_focus_obj(button_primary(scr, "Disable USB storage", usb_storage_disable));
+}
+
 static void adb(void) {
 	int rc = device_start_adb();
 	if (lbl_note) {
@@ -1072,6 +1093,9 @@ static void show_advanced(void) {
 	}
 	row(scr, "Wipe OTA partition", wipe_ota, true);
 	row(scr, "Start ADB", adb, false);
+	if (storage_card_present()) {
+		row(scr, "USB storage", show_usb_storage, true);
+	}
 	button(scr, "Back", show_main, false);
 	lv_group_focus_obj(first);
 }

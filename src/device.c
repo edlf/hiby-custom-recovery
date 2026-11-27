@@ -10,6 +10,7 @@
 
 #include "bootloader.h"
 #include "log.h"
+#include "storage.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -625,3 +626,60 @@ int mtd_dump_end(mtd_dump_t *d, mtd_dump_stats_t *st) {
 	return rc;
 }
 
+
+static bool usb_storage_on, adb_before_storage;
+static char usb_storage_disk[32];
+
+bool device_usb_storage_on(void) { return usb_storage_on; }
+
+int device_usb_storage(bool on) {
+	if (on == usb_storage_on) {
+		return 0;
+	}
+	if (on) {
+		const char *disk = storage_card_disk();
+		if (!disk) {
+			LOG("usb storage: no card");
+			return -1;
+		}
+		if (storage_export() != 0) {
+			LOG("usb storage: the card is busy and cannot be unmounted");
+			return -1;
+		}
+		adb_before_storage = access("/sys/kernel/config/usb_gadget/adb_demo", F_OK) == 0;
+		if (adb_before_storage) {
+			run("/etc/init.d/adb/S440adb stop");
+		}
+		snprintf(usb_storage_disk, sizeof(usb_storage_disk), "%s", disk);
+		if (run("/usr/bin/usb_dev_mass_storage.sh start %s", usb_storage_disk) != 0) {
+			run("/usr/bin/usb_dev_mass_storage.sh stop %s", usb_storage_disk);
+			storage_unexport();
+			if (adb_before_storage) {
+				device_start_adb();
+			}
+			return -1;
+		}
+		usb_storage_on = true;
+		LOG("usb storage: %s on USB", usb_storage_disk);
+		return 0;
+	}
+	run("/usr/bin/usb_dev_mass_storage.sh stop %s", usb_storage_disk);
+	usb_storage_on = false;
+	storage_unexport();
+	LOG("usb storage: off");
+	if (adb_before_storage) {
+		device_start_adb();
+		adb_before_storage = false;
+	}
+	return 0;
+}
+
+void device_backlight_on(void) {
+	const char *node = "/sys/class/backlight/backlight_pwm0/brightness";
+	FILE *f = fopen(node, "w");
+	if (!f || fputs("60\n", f) < 0 || fclose(f) != 0) {
+		LOG("backlight: %s cannot be written", node);
+		return;
+	}
+	LOG("backlight on");
+}
