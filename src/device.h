@@ -133,6 +133,14 @@ const char *bootloader_dir(void);
 // out, or "''" when it does not fit.
 const char *shq(const char *s, char *out, size_t size);
 
+// USB mass storage: the card as a disk on the PC, with HiBy's own
+// /usr/bin/usb_dev_mass_storage.sh (its own configfs gadget, android0).
+// The card is unmounted here first and not mounted again until it is off
+// (storage.h). ADB uses the same USB controller: if it is running it is
+// stopped, and started again when storage is turned off. 0 on success.
+int device_usb_storage(bool on);
+bool device_usb_storage_on(void);
+
 // system() with the command logged and its exit status returned (-1 when it
 // did not run).
 int run(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

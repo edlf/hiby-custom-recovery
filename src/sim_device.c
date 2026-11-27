@@ -584,8 +584,22 @@ static int sim_card_mode(bool rw) {
 	return 0;
 }
 
+static bool sim_exported;
+int storage_export(void) {
+	sim_exported = true;
+	LOG("sim: card unmounted for USB");
+	return 0;
+}
+void storage_unexport(void) { sim_exported = false; }
+bool storage_exported(void) { return sim_exported; }
+const char *storage_card_disk(void) { return storage_card_present() ? "/dev/mmcblk0" : NULL; }
+
 int storage_mount(int timeout_s, char *mnt, size_t mnt_size) {
 	(void)timeout_s;
+	if (sim_exported) {
+		LOG("sim: the card is on USB, not mounted here");
+		return -1;
+	}
 	if (!storage_card_present()) {
 		LOG("sim: no card (%s/sd does not exist)", sim_dir());
 		return -1;
@@ -601,4 +615,25 @@ void storage_unmount(void) {
 	if (storage_card_present()) {
 		sim_card_mode(false);
 	}
+}
+
+// USB mass storage: the card is handed over and taken back, nothing more.
+static bool sim_usb_storage;
+bool device_usb_storage_on(void) { return sim_usb_storage; }
+int device_usb_storage(bool on) {
+	if (on == sim_usb_storage) {
+		return 0;
+	}
+	if (on && (!storage_card_present() || getenv("SIM_USB_STORAGE_FAIL"))) {
+		LOG("sim: usb storage: %s", storage_card_present() ? "SIM_USB_STORAGE_FAIL" : "no card");
+		return -1;
+	}
+	if (on) {
+		storage_export();
+	} else {
+		storage_unexport();
+	}
+	sim_usb_storage = on;
+	LOG("sim: usb_dev_mass_storage.sh %s /dev/mmcblk0", on ? "start" : "stop");
+	return 0;
 }

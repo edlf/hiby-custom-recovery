@@ -17,6 +17,7 @@ static const char *const CANDIDATES[] = {
 static const char *const FSTYPES[] = {"vfat", "exfat"};
 
 static bool mounted_here;
+static bool exported; // on USB mass storage: the PC's
 static char cur_mnt[256]; // where the card is mounted, "" when it is not
 
 static int remount(const char *dir, bool rw) {
@@ -84,6 +85,10 @@ static int find_existing(char *mnt, size_t mnt_size) {
 }
 
 int storage_mount(int timeout_s, char *mnt, size_t mnt_size) {
+	if (exported) {
+		LOG("storage: the card is on USB, not mounted here");
+		return -1;
+	}
 	if (find_existing(mnt, mnt_size) == 0) {
 		LOG("storage: card already mounted at %s", mnt);
 		snprintf(cur_mnt, sizeof(cur_mnt), "%s", mnt);
@@ -147,3 +152,36 @@ void storage_unmount(void) {
 		cur_mnt[0] = '\0';
 	}
 }
+
+const char *storage_card_disk(void) {
+	static const char *const DISKS[] = {"/dev/mmcblk0", "/dev/mmcblk1"};
+	for (size_t i = 0; i < sizeof(DISKS) / sizeof(DISKS[0]); i++) {
+		if (access(DISKS[i], F_OK) == 0) {
+			return DISKS[i];
+		}
+	}
+	return NULL;
+}
+
+int storage_export(void) {
+	sync();
+	char mnt[256];
+	for (int i = 0; i < 4 && find_existing(mnt, sizeof(mnt)) == 0; i++) {
+		if (umount(mnt) != 0) {
+			LOG("storage: umount %s: %s", mnt, strerror(errno));
+			return -1;
+		}
+		LOG("storage: %s unmounted for USB", mnt);
+	}
+	if (find_existing(mnt, sizeof(mnt)) == 0) {
+		return -1;
+	}
+	mounted_here = false;
+	cur_mnt[0] = '\0';
+	exported = true;
+	return 0;
+}
+
+void storage_unexport(void) { exported = false; }
+
+bool storage_exported(void) { return exported; }
