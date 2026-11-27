@@ -18,8 +18,13 @@
 //      fits the partition, its partition table area blank
 //   2. the partition as it is: read whole; refused unless it has a partition
 //      table ("nand" at 0x5800) and no bad block
-//   3. the image gets the player's own table (0x5800-0x5bff) copied in, so
-//      the table is never replaced by a guess
+//   3. the player's table (0x5800-0x5bff) is checked against the one
+//      bundled beside the image (partition-table.bin, from
+//      partitions/<model>.txt, with its .md5): the same partitions in the
+//      same order and places, or nothing is written (parttable.h). The R1's
+//      firmware 2.0 table, with "rootfs" twice, gets entry 4 renamed
+//      "rootfs2", as it was before 2.0 and is on the R3 Pro II. The image
+//      gets that table copied in, so the table is never replaced by a guess
 //   4. a copy of the old partition goes to the card (uboot-backup-N.bin)
 //      when one can be mounted
 //   5. erase, write, read back and compare; on a mismatch written once more;
@@ -32,7 +37,7 @@
 
 // Reads the partition (once; again after an install).
 bool bootloader_is_zees(void);
-// The bundled image is there and this model may install it.
+// The bundled image and table are there and this model may install it.
 bool bootloader_can_install(void);
 
 typedef enum {

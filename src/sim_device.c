@@ -171,8 +171,10 @@ int device_start_adb(void) {
 }
 
 // The uboot partition: $SIM_DIR/mtd0, 512 KiB. Created as a stand-in for
-// the stock loader (SPL magic, a partition table, no "ota:fastboot") when
-// missing; copy a real dump there (~/r1-mtd/mtd0) to try with that.
+// the stock loader (SPL magic, the stock partition table, no "ota:fastboot")
+// when missing; copy a real dump there (~/r1-mtd/mtd0) to try with that. The
+// table is the R1's firmware 2.0 one ("rootfs" twice) on the R1, the R3 Pro
+// II's on that, so "Install fastboot" checks and fixes it as on the players.
 // SIM_UBOOT_BAD=1 marks a bad block; SIM_UBOOT_CORRUPT=N spoils the first N
 // writes (a read back that differs).
 static void mtd0_path(char *out, size_t size) { sim_path(out, size, "mtd0"); }
@@ -187,7 +189,29 @@ static int ensure_mtd0(void) {
 	memset(img, 0xff, sizeof(img));
 	static const uint8_t magic[8] = {0x06, 0x05, 0x04, 0x03, 0x02, 0x55, 0xaa, 0x55};
 	memcpy(img, magic, sizeof(magic));
-	memcpy(img + 0x5800, "nand\x07\0\0\0uboot", 13);
+	// name, size, offset, mask_flags, manager (1: ubi), as parttable.h reads
+	static const struct {
+		const char *name;
+		uint32_t size, offset, manager;
+	} table[] = {
+		{"uboot", 0x80000, 0, 0},			  {"kernel", 0x500000, 0x80000, 0},
+		{"rootfs", 0x2d00000, 0x580000, 0},	  {"kernel2", 0x500000, 0x3280000, 0},
+		{SIM_ROOTFS2, 0x1800000, 0x3780000, 0}, {"ota", 0x80000, 0x4f80000, 0},
+		{"userdata", 0x3000000, 0x5000000, 1},
+	};
+	uint8_t *t = img + 0x5800;
+	memcpy(t, "nand", 4);
+	t[4] = sizeof(table) / sizeof(table[0]);
+	t[5] = t[6] = t[7] = 0;
+	for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+		uint8_t *e = t + 8 + i * 48;
+		uint32_t v[4] = {table[i].size, table[i].offset, 0, table[i].manager};
+		memset(e, 0, 32);
+		memcpy(e, table[i].name, strlen(table[i].name));
+		for (int k = 0; k < 16; k++) {
+			e[32 + k] = (uint8_t)(v[k / 4] >> (8 * (k % 4)));
+		}
+	}
 	mkdir(sim_dir(), 0755);
 	FILE *f = fopen(p, "wb");
 	if (!f) {

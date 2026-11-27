@@ -3,6 +3,7 @@
 #include "device.h"
 #include "log.h"
 #include "model.h"
+#include "parttable.h"
 #include "storage.h"
 
 #include <pthread.h>
@@ -15,8 +16,10 @@
 #include <unistd.h>
 
 #define SIGNATURE "ota:fastboot"
-#define PART_TABLE_OFF 0x5800
-#define PART_TABLE_LEN 0x400
+#define PART_TABLE_OFF PT_OFF
+#define PART_TABLE_LEN PT_LEN
+// The expected partition table, from partitions/<model>.txt (pack_recovery.sh)
+#define TABLE_FILE "partition-table.bin"
 #define TMP_IMAGE "/tmp/zees-uboot.bin"
 #define TMP_ORIG "/tmp/zees-uboot-orig.bin"
 
@@ -103,13 +106,18 @@ static void image_path(char *out, size_t size, const char *suffix) {
 	snprintf(out, size, "%s/%s%s", bootloader_dir(), g_model.uboot_image, suffix);
 }
 
+static void table_path(char *out, size_t size, const char *suffix) {
+	snprintf(out, size, "%s/" TABLE_FILE "%s", bootloader_dir(), suffix);
+}
+
 bool bootloader_can_install(void) {
 	if (!g_model.uboot_installable) {
 		return false;
 	}
-	char p[512];
+	char p[512], t[512];
 	image_path(p, sizeof(p), "");
-	return access(p, R_OK) == 0;
+	table_path(t, sizeof(t), "");
+	return access(p, R_OK) == 0 && access(t, R_OK) == 0;
 }
 
 static uint8_t *load_file(const char *path, size_t *len) {
@@ -153,6 +161,24 @@ static int md5_of(const char *path, char out[33]) {
 	char *r = fgets(line, sizeof(line), p);
 	int rc = pclose(p);
 	return (r && rc == 0 && sscanf(line, "%32s", out) == 1) ? 0 : -1;
+}
+
+// The file at path, if its md5 is the one recorded in md5_path.
+static uint8_t *load_checked(const char *path, const char *md5_path, size_t *len) {
+	char want[40] = "", have[33];
+	FILE *mf = fopen(md5_path, "r");
+	if (mf) {
+		if (fscanf(mf, "%32s", want) != 1) {
+			want[0] = '\0';
+		}
+		fclose(mf);
+	}
+	uint8_t *buf = load_file(path, len);
+	if (!buf || md5_of(path, have) != 0 || strlen(want) != 32 || strcmp(have, want) != 0) {
+		free(buf);
+		return NULL;
+	}
+	return buf;
 }
 
 // Erase, write `file` (the whole partition is erased; nandwrite pads the
@@ -201,25 +227,27 @@ static void backup_to_card(const uint8_t *orig, size_t len) {
 
 static void *worker(void *arg) {
 	(void)arg;
-	uint8_t *img = NULL, *orig = NULL;
-	size_t img_len = 0;
+	uint8_t *img = NULL, *orig = NULL, *want_table = NULL;
+	size_t img_len = 0, table_len = 0;
 	long long psize = 0;
-	char path[512], md5_want[40] = "", md5_have[33];
+	char path[512], md5_path[520];
+	uint8_t table[PART_TABLE_LEN];
+	char why[160];
+	bool table_fixed = false;
 
 	phase("Checking the bundled image");
 	image_path(path, sizeof(path), "");
-	img = load_file(path, &img_len);
-	char md5_path[520];
 	image_path(md5_path, sizeof(md5_path), ".md5");
-	FILE *mf = fopen(md5_path, "r");
-	if (mf) {
-		if (fscanf(mf, "%32s", md5_want) != 1) {
-			md5_want[0] = '\0';
-		}
-		fclose(mf);
-	}
-	if (!img || md5_of(path, md5_have) != 0 || strlen(md5_want) != 32 || strcmp(md5_have, md5_want) != 0) {
+	img = load_checked(path, md5_path, &img_len);
+	if (!img) {
 		finish(BL_FAILED, "The bundled bootloader image is missing or corrupt. Nothing was changed.");
+		goto out;
+	}
+	table_path(path, sizeof(path), "");
+	table_path(md5_path, sizeof(md5_path), ".md5");
+	want_table = load_checked(path, md5_path, &table_len);
+	if (!want_table || table_len != PART_TABLE_LEN) {
+		finish(BL_FAILED, "The bundled partition table is missing or corrupt. Nothing was changed.");
 		goto out;
 	}
 	if (img_len < PART_TABLE_OFF + PART_TABLE_LEN || memcmp(img, SPL_MAGIC, sizeof(SPL_MAGIC)) != 0) {
@@ -257,6 +285,22 @@ static void *worker(void *arg) {
 		finish(BL_FAILED, "The bootloader partition has no partition table at 0x5800. Nothing was changed.");
 		goto out;
 	}
+
+	// The player's table, as partitions/<model>.txt has it (parttable.h); the
+	// duplicated "rootfs" of the R1's firmware 2.0 is renamed "rootfs2".
+	phase("Checking the partition table");
+	switch (pt_check(orig + PART_TABLE_OFF, want_table, table, why, sizeof(why))) {
+	case PT_SAME:
+		LOG("bootloader: partition table %s", why);
+		break;
+	case PT_FIXED:
+		LOG("bootloader: partition table: %s", why);
+		table_fixed = true;
+		break;
+	case PT_MISMATCH:
+		finish(BL_FAILED, "The player's partition table is not the expected one: %s. Nothing was changed.", why);
+		goto out;
+	}
 	int bad = uboot_part_bad_blocks();
 	if (bad != 0) {
 		finish(BL_FAILED, bad > 0 ? "The bootloader partition has a bad block. Nothing was changed."
@@ -269,8 +313,8 @@ static void *worker(void *arg) {
 		first_size = psize;
 	}
 
-	// The player's own partition table into the new image.
-	memcpy(img + PART_TABLE_OFF, orig + PART_TABLE_OFF, PART_TABLE_LEN);
+	// The player's own partition table into the new image (fixed, if it was).
+	memcpy(img + PART_TABLE_OFF, table, PART_TABLE_LEN);
 	if (save_file(TMP_IMAGE, img, img_len) != 0 || save_file(TMP_ORIG, orig, (size_t)psize) != 0) {
 		finish(BL_FAILED, "Cannot stage the image in /tmp. Nothing was changed.");
 		goto out;
@@ -283,8 +327,9 @@ static void *worker(void *arg) {
 			zees_cached = -1;
 			free(first_orig);
 			first_orig = NULL;
-			finish(BL_DONE, "Zee's bootloader is installed. Fastboot: hold Play/Pause at power-on, or use "
-							"\"Reboot to fastboot\".");
+			finish(BL_DONE, "Zee's bootloader is installed%s. Fastboot: hold Play/Pause at power-on, or use "
+							"\"Reboot to fastboot\".",
+				   table_fixed ? ", and the partition table's second \"rootfs\" is now \"rootfs2\"" : "");
 			goto out;
 		}
 		LOG("bootloader: read back differs (attempt %d)", attempt);
@@ -310,6 +355,7 @@ out:
 	unlink(TMP_ORIG);
 	free(img);
 	free(orig);
+	free(want_table);
 	return NULL;
 }
 

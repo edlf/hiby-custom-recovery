@@ -22,9 +22,7 @@
 //                 its compatibility record says (update.c).
 //   uboot_image   Zee's bootloader's file name in the recovery root fs
 //                 (bootloader.h), the base image without a partition table
-//   uboot_installable  whether the recovery offers to install it. Not on the
-//                 R3 Pro II: its board has not been compared with its stock
-//                 loader yet (uboot/README.md).
+//   uboot_installable  whether the recovery offers to install it
 //   panel_w/h     the framebuffer the model has, only checked to warn
 
 typedef struct {
@@ -41,7 +39,7 @@ typedef struct {
 #if defined(MODEL_R1)
 #define MODEL_INIT {"HiBy R1", "r1", "hiby_r1_", 1, "HiBy R1", "u-boot-hiby_r1.bin", 1, 480, 800}
 #elif defined(MODEL_R3PROII)
-#define MODEL_INIT {"HiBy R3 Pro II", "r3proii", "hiby_r3proii_", 0, "HiBy R3PROII", "u-boot-hiby_r3proii.bin", 0, 480, 720}
+#define MODEL_INIT {"HiBy R3 Pro II", "r3proii", "hiby_r3proii_", 0, "HiBy R3PROII", "u-boot-hiby_r3proii.bin", 1, 480, 720}
 #else
 #error "build with MODEL_R1 or MODEL_R3PROII (make MODEL=r1 or MODEL=r3proii)"
 #endif

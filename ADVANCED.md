@@ -207,20 +207,27 @@ partition (its SPL and U-Boot both look for that request). HiBy's
 bootloader has no fastboot, so with it "Reboot to fastboot" would just
 start the system. That's why the menu shows **Install fastboot** instead.
 
-It's not offered on the R3 Pro II yet: its board hasn't been compared with
-its stock loader (see `uboot/README.md`).
-
-`pack_recovery.sh` bundles `output/r1/u-boot-hiby_r1.bin` (the base image,
-with a blank partition table area) as
-`/usr/share/zees-recovery/u-boot-hiby_r1.bin`, plus its md5.
+`pack_recovery.sh` bundles `output/<model>/u-boot-hiby_<model>.bin` (the
+base image, with a blank partition table area) as
+`/usr/share/zees-recovery/u-boot-hiby_<model>.bin`, plus its md5, and the
+table of `partitions/<model>.txt` as
+`/usr/share/zees-recovery/partition-table.bin`, plus its md5.
 
 The install:
 
 1. Checks the bundled image: md5, SPL header magic, size, blank table area.
 2. Reads the whole `uboot` partition. Refuses if there's no partition table
    (`nand` at 0x5800) or a bad block.
-3. Copies the player's own partition table (0x5800–0x5bff) into the image.
-   For a stock R1 the result equals `u-boot-hiby_r1-withparts.bin`.
+3. Checks the player's partition table (0x5800–0x5bff) against the bundled
+   one: the same partitions in the same order, with the same offsets,
+   sizes, flags and manager, or nothing is written. Names must match too,
+   except one: the R1's firmware 2.0 wrote a table that calls the recovery
+   root fs (partition 4) `rootfs` again, so `rootfs` is there twice. It was
+   `rootfs2` before 2.0, and is on the R3 Pro II; HiBy's own OTA scripts
+   look it up by that name. That entry is renamed `rootfs2`, every other
+   byte of the table is kept (`src/parttable.c`). The table goes into the
+   image, so for a stock player the result equals
+   `u-boot-hiby_<model>-withparts.bin`.
 4. Saves the old partition to the card as `uboot-backup-N.bin`, if a card
    is present.
 5. Erases, writes, reads back and compares. On a mismatch it writes once
@@ -332,7 +339,7 @@ Reboot and power off quit the simulator.
 | `$SIM_DIR/data/` | what a factory reset empties |
 | `$SIM_DIR/mtd0` | the `uboot` partition; a stock stand-in is created if missing (copy `~/r1-mtd/mtd0` for the real one) |
 | `$SIM_DIR/mtd1` … `mtd6` | other partitions, created empty (sparse) if missing; link `~/r1-mtd/mtdN` for real data |
-| `$SIM_DIR/share/` | the bundled bootloader: `u-boot-hiby_r1.bin` and `u-boot-hiby_r1.bin.md5` (just the md5 on one line) |
+| `$SIM_DIR/share/` | the bundled bootloader: `u-boot-hiby_<model>.bin` and `u-boot-hiby_<model>.bin.md5` (just the md5 on one line), and `partition-table.bin` with its `.md5` (`build/parttable-<model>.bin` from `./build_images.sh`) |
 
 A restore writes `$SIM_DIR/mtdN`. If that's a link (to `~/r1-mtd`, say),
 it's replaced by a copy first, so your dump is never overwritten.
