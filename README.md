@@ -58,6 +58,38 @@ Good to know:
 - Every update is verified after writing. If it fails, the player keeps
   starting the recovery instead of a broken system.
 
+## The charger
+
+The recovery boots without changing how the battery is charged, and touches
+nothing of the main system's: all of this is in `overlay/`, which only the
+recovery's root fs gets.
+
+On the R1 the charger is the AXP2101 PMIC. Its driver's probe writes the
+charger registers whenever it loads (with the stock `axp2101.sh`, a 4.40 V
+end of charge voltage, and its own charge current, input current limit,
+precharge and termination); on the main system Sonix Player puts its own
+back a few seconds later, in the recovery nothing would. So the R1's
+`driver_default_init_script.sh` runs `keep-charger.sh` (both in
+`overlay/r1/module_driver/`) in place of `sh axp2101.sh`: registers 0x16,
+0x61, 0x62, 0x63 and 0x64 are read over I2C before the driver loads and
+written back through its `/sys/class/axp/axp_reg` afterwards, and
+`usb/constant_charge_current_max` (mA) gets the same charge current, which
+the driver applies again after every plug-in. The PMIC keeps its registers
+over a reboot, so this is what the main system left. A charge current of 0
+is not kept. The script creates no file; what it did goes to the console.
+
+On the R3 Pro II the charger is an MP2731, which keeps nothing over a reboot:
+its driver (`kernel/module_drivers/hiby/r3proii/mp2731`) resets the chip and
+sets it from `mp2731.sh` every time it loads, on the main system too. The
+player's charge limit is the driver's, not the chip's, so the recovery
+cannot keep it; its `mp2731.sh` (`overlay/r3proii/module_driver/`, the stock
+one with `charge_limit_percent=80` added) starts the driver at an 80 % limit
+instead, which the driver holds from the fuel gauge on its own.
+
+The overlays are used with the Sonix kernel (`pack_recovery.sh --kernel`,
+what `build_recovery.sh` does by default); `--stock-kernel` keeps HiBy's
+scripts as they are.
+
 ## Building
 
 From the top of the repository:
