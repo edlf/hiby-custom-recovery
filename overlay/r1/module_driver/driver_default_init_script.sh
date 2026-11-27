@@ -5,7 +5,7 @@ sh rmem_manager.sh
 sh soc_utils.sh
 sh soc_i2c.sh
 sh i2c_gpio_add.sh
-sh axp2101.sh
+sh keep-charger.sh
 sh cw2015.sh
 sh keyboard_gpio_add.sh
 sh soc_pwm.sh
