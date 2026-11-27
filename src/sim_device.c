@@ -637,3 +637,5 @@ int device_usb_storage(bool on) {
 	LOG("sim: usb_dev_mass_storage.sh %s /dev/mmcblk0", on ? "start" : "stop");
 	return 0;
 }
+
+void device_backlight_on(void) { LOG("sim: backlight on"); }

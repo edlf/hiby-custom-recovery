@@ -10,11 +10,17 @@
 
 #include "lvgl/lvgl.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef HOST_BUILD
+#include <linux/fb.h>
+#include <sys/ioctl.h>
+#endif
 
 const model_t g_model = MODEL_INIT;
 
@@ -26,6 +32,26 @@ static uint32_t tick_ms(void) {
 
 #ifdef HOST_BUILD
 int sim_main(int argc, char **argv); // sim_platform.c
+#else
+// soc_fb (kernel module_drivers/hiby/common/soc_fb) shows nothing until a
+// pan: unblanking only sets the controller up, and each FBIOPAN_DISPLAY
+// points it at a frame (a descriptor that repeats it) and starts the fetch,
+// flushing the CPU's write buffer first (the mapping is write-through). HiBy's
+// logo app panned after its picture; LVGL's fbdev driver never pans. So
+// after every redraw the frame LVGL draws into is panned to, as Sonix Player
+// does: the one at the yoffset the screen info gave when /dev/fb0 was
+// opened, which LVGL's driver takes too.
+static int pan_fd = -1;
+static struct fb_var_screeninfo pan_var;
+
+static void pan_after_render(lv_event_t *e) {
+	(void)e;
+	static bool warned;
+	if (ioctl(pan_fd, FBIOPAN_DISPLAY, &pan_var) != 0 && !warned) {
+		warned = true;
+		LOG("fb: FBIOPAN_DISPLAY failed: the screen may stay black");
+	}
+}
 #endif
 
 int main(int argc, char **argv) {
@@ -54,6 +80,12 @@ int main(int argc, char **argv) {
 		LOG("no framebuffer, giving up");
 		return 1;
 	}
+	pan_fd = open("/dev/fb0", O_RDWR);
+	if (pan_fd >= 0 && ioctl(pan_fd, FBIOGET_VSCREENINFO, &pan_var) == 0) {
+		lv_display_add_event_cb(disp, pan_after_render, LV_EVENT_RENDER_READY, NULL);
+	} else {
+		LOG("fb: cannot read the screen info for the pan: the screen may stay black");
+	}
 	int32_t w = lv_display_get_horizontal_resolution(disp), h = lv_display_get_vertical_resolution(disp);
 	LOG("display %dx%d", (int)w, (int)h);
 	if (w != g_model.panel_w || h != g_model.panel_h) {
@@ -63,6 +95,13 @@ int main(int argc, char **argv) {
 	style_init();
 	lv_indev_t *keys = input_init(disp);
 	ui_init(disp, keys);
+	// No boot logo lights the panel any more (pack_recovery.sh): the
+	// backlight comes on once the menu is on the screen (drawn and panned
+	// to), after the 100 ms the R1's LG35583 wants, as the stock logo
+	// script waited.
+	lv_refr_now(disp);
+	usleep(100 * 1000);
+	device_backlight_on();
 
 	for (;;) {
 		uint32_t idle = lv_timer_handler();

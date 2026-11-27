@@ -141,6 +141,11 @@ const char *shq(const char *s, char *out, size_t size);
 int device_usb_storage(bool on);
 bool device_usb_storage_on(void);
 
+// The backlight on, at the stock level (60, as HiBy's
+// S11jpeg_display_shell set it after its logo, which the recovery does not
+// have): called once the first frame is drawn.
+void device_backlight_on(void);
+
 // system() with the command logged and its exit status returned (-1 when it
 // did not run).
 int run(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

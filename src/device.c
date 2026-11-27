@@ -673,3 +673,13 @@ int device_usb_storage(bool on) {
 	}
 	return 0;
 }
+
+void device_backlight_on(void) {
+	const char *node = "/sys/class/backlight/backlight_pwm0/brightness";
+	FILE *f = fopen(node, "w");
+	if (!f || fputs("60\n", f) < 0 || fclose(f) != 0) {
+		LOG("backlight: %s cannot be written", node);
+		return;
+	}
+	LOG("backlight on");
+}
